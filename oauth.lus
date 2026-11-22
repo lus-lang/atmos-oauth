@@ -1,0 +1,913 @@
+--- Signs users in with the authorization code flow of OAuth 2.0 and OpenID Connect.
+---
+--- A provider holds the endpoints of an authorization server and the
+--- credentials of one client. `provider:authorize_url` builds the URL that
+--- the browser of the user visits, with a random `state`, a PKCE challenge,
+--- and a `nonce`. `provider:exchange` trades the code of the callback for
+--- tokens and validates the ID token against the keys of the provider.
+--- `provider:refresh` renews the tokens. `provider:userinfo` reads the
+--- profile of the user.
+---
+--- `oauth.provider` accepts the name of a preset, which is `"github"`,
+--- `"google"`, `"microsoft"`, `"apple"`, `"gitlab"`, or `"discord"`, or a
+--- table of settings for any other server. A provider with an `issuer` and
+--- no endpoints reads them from the OpenID Connect discovery document of
+--- the issuer.
+---
+--- The following example signs a user in with Google in two requests. The
+--- application stores `flow` in the session of the user between them.
+---
+--- ```lus nocheck
+--- local oauth = require("https://atmosp.here/2.0/oauth.lus")
+--- local google = oauth.provider("google", {
+---     client_id = id, client_secret = secret, redirect = "https://app.example/callback",
+--- })
+---
+--- -- The first request sends the browser to Google.
+--- local url, flow = google:authorize_url()
+---
+--- -- The callback request carries the code and the state in its query.
+--- local tokens = google:exchange(req.query_params, flow)
+--- print(tokens.claims.sub, tokens.claims.email)
+--- ```
+---
+--- @package oauth
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-oauth
+--- @permission network:http Sends the discovery, key, token, and userinfo requests with `network.fetch`.
+
+local jwt = require("https://atmosp.here/2.0/jwt.lus")
+
+local M = {}
+
+local type, tostring, pairs, ipairs = type, tostring, pairs, ipairs
+
+-- Errors ------------------------------------------------------------------------
+
+local OauthError = {}
+OauthError.__index = OauthError
+OauthError.__tostring = function(err)
+    return "oauth: " .. err.message
+end
+
+local function raise(code, message, fields)
+    local err = fields or {}
+    err.code = code
+    err.message = message
+    error(setmetatable(err, OauthError), 0)
+end
+
+--- Returns true if `value` is an error object that `oauth` raised.
+---
+--- Such an error has a `code` and a `message`. The codes are the following.
+---
+--- - `"state"`: the `state` of the callback differs from the state of the flow.
+--- - `"provider"`: the provider answered with an OAuth error. The error holds
+---   the `error` code of the provider, its `description` when the provider
+---   sent one, and the `status` of the response when the error came from an
+---   endpoint.
+--- - `"response"`: a response is not what the protocol requires, such as a
+---   body that is not JSON, a token response without an access token, or a
+---   discovery document of another issuer. The error holds the `status`.
+--- - `"network"`: a request got no response. The error holds the transport
+---   error in `cause`.
+--- - `"id_token"`: the ID token is invalid. When `jwt.verify` rejected it,
+---   the error holds the error object of `jwt` in `cause`.
+--- @param value any The value to test.
+--- @return boolean
+function M.is_error(value)
+    return getmetatable(value) == OauthError
+end
+
+-- Encoding ----------------------------------------------------------------------
+
+local function b64url(data)
+    return (string.transcode(data, "binary", "base64"):gsub("=+$", ""):gsub("+", "-"):gsub("/", "_"))
+end
+
+local function unb64url(text)
+    local padded = text:gsub("-", "+"):gsub("_", "/")
+    local rest = #padded % 4
+    if rest > 0 then
+        padded = padded .. string.rep("=", 4 - rest)
+    end
+    local ok, bytes = catch string.transcode(padded, "base64", "binary")
+    if not ok then
+        return nil
+    end
+    return type(bytes) == "string" and vector.fromstring(bytes) or bytes
+end
+
+-- Percent-encodes every byte outside the unreserved set of RFC 3986.
+local function escape(value)
+    local text = tostring(value)
+    if not text:find("[^%w%-%._~]") then
+        return text
+    end
+    local bytes = vector.fromstring(text)
+    local out = {}
+    for i = 0, vector.size(bytes) - 1 do
+        local b = vector.get(bytes, i)
+        if b >= 48 and b <= 57 or b >= 65 and b <= 90 or b >= 97 and b <= 122
+            or b == 45 or b == 46 or b == 95 or b == 126
+        then
+            out[#out + 1] = string.char(b)
+        else
+            out[#out + 1] = string.format("%%%02X", b)
+        end
+    end
+    return table.concat(out)
+end
+
+-- Encodes a table as a query string, with its keys in sorted order.
+local function encode_query(fields)
+    local names = {}
+    for name in pairs(fields) do
+        names[#names + 1] = name
+    end
+    table.sort(names)
+    local out = {}
+    for i, name in ipairs(names) do
+        out[i] = `$(escape(name))=$(escape(fields[name]))`
+    end
+    return table.concat(out, "&")
+end
+
+local function random_token()
+    return b64url(crypto.random(32))
+end
+
+--- Returns the PKCE challenge of a code verifier.
+---
+--- The challenge is the SHA-256 hash of `verifier` in base64url without
+--- padding, which RFC 7636 names the `S256` method.
+--- `provider:authorize_url` computes it for the verifier that it generates.
+--- @param verifier string The code verifier.
+--- @return string The challenge.
+function M.challenge(verifier)
+    return b64url(crypto.hash("sha256", verifier))
+end
+
+-- Presets -----------------------------------------------------------------------
+
+local ASYMMETRIC = {
+    RS256 = true, RS384 = true, RS512 = true, PS256 = true, PS384 = true, PS512 = true,
+    ES256 = true, ES384 = true, EdDSA = true,
+}
+local DEFAULT_ALGORITHMS = { "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA" }
+
+local APPLE_ISSUER = "https://appleid.apple.com"
+
+-- Builds the client secret of Apple: an ES256 token signed with the key of
+-- the developer account. The function signs a new one shortly before the
+-- last one expires.
+local function apple_secret(options, clock)
+    local team_id, key_id, key = options.team_id, options.key_id, options.private_key
+    if type(team_id) ~= "string" or type(key_id) ~= "string" or key == nil then
+        error("oauth.provider: the apple preset needs team_id, key_id, and private_key", 3)
+    end
+    if type(key) == "string" then
+        local ok, imported = catch crypto.importkey(key)
+        if not ok then
+            error("oauth.provider: cannot read private_key: " .. tostring(imported), 3)
+        end
+        key = imported
+    end
+    local ttl = options.client_secret_ttl or 3600
+    local client_id = options.client_id
+    local cached, expires = nil, 0
+    return function()
+        local now = clock()
+        if cached == nil or now >= expires - 60 then
+            cached = jwt.sign({ iss = team_id, aud = APPLE_ISSUER, sub = client_id }, key, {
+                alg = "ES256", expires_in = ttl, clock = clock, header = { kid = key_id },
+            })
+            expires = now + ttl
+        end
+        return cached
+    end
+end
+
+local PRESETS = {
+    github = function()
+        return {
+            authorization_endpoint = "https://github.com/login/oauth/authorize",
+            token_endpoint = "https://github.com/login/oauth/access_token",
+            userinfo_endpoint = "https://api.github.com/user",
+            auth = "post",
+        }
+    end,
+    google = function()
+        return {
+            issuer = "https://accounts.google.com",
+            authorization_endpoint = "https://accounts.google.com/o/oauth2/v2/auth",
+            token_endpoint = "https://oauth2.googleapis.com/token",
+            userinfo_endpoint = "https://openidconnect.googleapis.com/v1/userinfo",
+            jwks_uri = "https://www.googleapis.com/oauth2/v3/certs",
+            scope = { "openid", "email", "profile" },
+            auth = "post",
+        }
+    end,
+    microsoft = function(options)
+        local tenant = options.tenant or "common"
+        if type(tenant) ~= "string" or tenant:find("[^%w%.%-]") then
+            error("oauth.provider: tenant must be a tenant name or identifier", 3)
+        end
+        local base = `https://login.microsoftonline.com/$tenant`
+        local settings = {
+            authorization_endpoint = `$base/oauth2/v2.0/authorize`,
+            token_endpoint = `$base/oauth2/v2.0/token`,
+            userinfo_endpoint = "https://graph.microsoft.com/oidc/userinfo",
+            jwks_uri = `$base/discovery/v2.0/keys`,
+            scope = { "openid", "email", "profile" },
+            auth = "post",
+        }
+        if tenant:find("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") then
+            settings.issuer = `$base/v2.0`
+        else
+            -- A shared endpoint signs for many tenants, so each token names
+            -- its own tenant in `tid` and in its issuer.
+            settings.issuer = function(claims)
+                local tid = claims.tid
+                if type(tid) ~= "string" or tid:find("[^%x%-]") then
+                    return nil
+                end
+                return `https://login.microsoftonline.com/$tid/v2.0`
+            end
+        end
+        return settings
+    end,
+    apple = function(options, clock)
+        return {
+            issuer = APPLE_ISSUER,
+            authorization_endpoint = "https://appleid.apple.com/auth/authorize",
+            token_endpoint = "https://appleid.apple.com/auth/token",
+            jwks_uri = "https://appleid.apple.com/auth/keys",
+            auth = "post",
+            nonce = true,
+            form_post = true,
+            client_secret = apple_secret(options, clock),
+        }
+    end,
+    gitlab = function(options)
+        local base = (options.base or "https://gitlab.com"):gsub("/+$", "")
+        return {
+            issuer = base,
+            authorization_endpoint = `$base/oauth/authorize`,
+            token_endpoint = `$base/oauth/token`,
+            userinfo_endpoint = `$base/oauth/userinfo`,
+            jwks_uri = `$base/oauth/discovery/keys`,
+            scope = { "openid", "email", "profile" },
+            auth = "post",
+        }
+    end,
+    discord = function()
+        return {
+            authorization_endpoint = "https://discord.com/oauth2/authorize",
+            token_endpoint = "https://discord.com/api/oauth2/token",
+            userinfo_endpoint = "https://discord.com/api/users/@me",
+            scope = { "identify" },
+            auth = "post",
+        }
+    end,
+}
+
+-- Providers ---------------------------------------------------------------------
+
+local Provider = {}
+Provider.__index = Provider
+Provider.__tostring = function(self)
+    return `oauth.provider: $(self.name)`
+end
+
+-- The client secret of each provider, kept out of the provider table so that
+-- a dump of the table shows none.
+local SECRETS = setmetatable({}, { __mode = "k" })
+
+local ENDPOINTS = { "authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri" }
+
+--- Creates a provider for one client of an authorization server.
+---
+--- `name` is the name of a preset. `options` holds the credentials of the
+--- client. A table in place of `name` is the options of a provider with
+--- no preset. The options are the following.
+---
+--- - `client_id`: the client identifier, which is required.
+--- - `client_secret`: the client secret as a string, or a function that
+---   returns it for each token request. A provider without one is a public
+---   client, which sends its `client_id` alone.
+--- - `redirect`: the redirect URI registered for the client.
+--- - `scope`: the default scopes, as a list or a string separated by spaces.
+--- - `auth`: how token requests carry the credentials. `"basic"` sends them
+---   in the `Authorization` header and is the default of a provider with no
+---   preset. `"post"` sends them in the body.
+--- - `pkce`: `false` leaves the PKCE challenge out of the flow.
+--- - `issuer`, `authorization_endpoint`, `token_endpoint`,
+---   `userinfo_endpoint`, `jwks_uri`: the issuer and the endpoints of the
+---   server. A provider with an `issuer` and without both of
+---   `authorization_endpoint` and `token_endpoint` reads every endpoint that
+---   the options leave out from `ISSUER/.well-known/openid-configuration`,
+---   in its first call that needs one.
+--- - `algorithms`: the signature algorithms accepted for ID tokens. The
+---   default is every asymmetric algorithm of `jwt`. A list that contains
+---   `none` or an HMAC algorithm raises an error.
+--- - `leeway`: the tolerance in seconds for the times of an ID token, which
+---   defaults to 60.
+--- - `jwks_ttl`: how many seconds the provider keeps the keys that it
+---   fetched, which defaults to 3600.
+--- - `jwks_cooldown`: the least number of seconds between two fetches of the
+---   keys that tokens with an unknown `kid` cause, which defaults to 60.
+--- - `fetch`: a function with the arguments and results of `network.fetch`
+---   that sends every request, which defaults to `network.fetch`.
+--- - `clock`: a function that returns the time in seconds, which defaults to
+---   `os.time`.
+---
+--- The presets set the endpoints, the default scopes, and `auth`. `"google"`,
+--- `"gitlab"`, `"microsoft"`, and `"apple"` are OpenID Connect providers
+--- whose ID tokens `provider:exchange` validates. `"github"` and `"discord"`
+--- are OAuth providers with no ID token, whose user comes from
+--- `provider:userinfo`. `"microsoft"` reads `tenant`, a tenant identifier
+--- or one of `"common"`, `"organizations"`, and `"consumers"`, which
+--- defaults to `"common"`. `"gitlab"` reads `base`, the URL of a GitLab
+--- instance, which defaults to `https://gitlab.com`. `"apple"` reads
+--- `team_id`, `key_id`, and `private_key`, the `.p8` key of the developer
+--- account as PEM text or as a key object of `crypto.importkey`. It signs
+--- its client secret with them as an ES256 token that lasts
+--- `client_secret_ttl` seconds, 3600 by default.
+---
+--- An unknown preset, a missing `client_id`, and an option of the wrong
+--- type each raise an error.
+--- @param name string|table The preset, or the options of a provider with no preset.
+--- @param options table? The options.
+--- @return table The provider.
+function M.provider(name, options)
+    if type(name) == "table" then
+        name, options = nil, name
+    end
+    if type(options) ~= "table" then
+        error("oauth.provider: options must be a table", 2)
+    end
+    if type(options.client_id) ~= "string" or options.client_id == "" then
+        error("oauth.provider: client_id must be a string", 2)
+    end
+    local clock = options.clock or os.time
+    local settings = {}
+    if name ~= nil then
+        local preset = PRESETS[name]
+        if preset == nil then
+            error(`oauth.provider: unknown preset '$(tostring(name))'`, 2)
+        end
+        settings = preset(options, clock)
+    end
+    local self = setmetatable({}, Provider)
+    self.name = name or options.issuer or options.authorization_endpoint or "custom"
+    self.client_id = options.client_id
+    self.redirect = options.redirect
+    self.scope = options.scope or settings.scope or {}
+    self.auth = options.auth or settings.auth or "basic"
+    if self.auth ~= "basic" and self.auth ~= "post" then
+        error("oauth.provider: auth must be \"basic\" or \"post\"", 2)
+    end
+    self.pkce = options.pkce ~= false
+    self.issuer = options.issuer or settings.issuer
+    if type(self.issuer) == "string" then
+        self.issuer = self.issuer:gsub("/+$", "")
+    end
+    for _, endpoint in ipairs(ENDPOINTS) do
+        self[endpoint] = options[endpoint] or settings[endpoint]
+    end
+    self.always_nonce = settings.nonce == true
+    self.form_post = settings.form_post == true
+    local algorithms = options.algorithms or DEFAULT_ALGORITHMS
+    if type(algorithms) ~= "table" or #algorithms == 0 then
+        error("oauth.provider: algorithms must be a list", 2)
+    end
+    for _, alg in ipairs(algorithms) do
+        if not ASYMMETRIC[alg] then
+            error(`oauth.provider: algorithm '$(tostring(alg))' cannot sign an ID token`, 2)
+        end
+    end
+    self.algorithms = algorithms
+    self.leeway = options.leeway or 60
+    self.jwks_ttl = options.jwks_ttl or 3600
+    self.jwks_cooldown = options.jwks_cooldown or 60
+    self.fetch = options.fetch or network.fetch
+    self.clock = clock
+    self.discovered = not (type(self.issuer) == "string"
+        and (self.authorization_endpoint == nil or self.token_endpoint == nil))
+    local secret = settings.client_secret or options.client_secret
+    if secret ~= nil and type(secret) ~= "string" and type(secret) ~= "function" then
+        error("oauth.provider: client_secret must be a string or a function", 2)
+    end
+    SECRETS[self] = secret
+    return self
+end
+
+-- Requests ----------------------------------------------------------------------
+
+-- Sends one request. Returns the status, the body as text, and the headers.
+local function send(self, method, url, headers, body)
+    local ok, status, data, response_headers = catch self.fetch(url, method, headers, body)
+    if not ok then
+        raise("network", `the request to $(url:match("^[^?]*")) failed: $(tostring(status))`, { cause = status })
+    end
+    if type(data) == "vector" then
+        data = vector.tostring(data)
+    end
+    return status, data or "", response_headers or {}
+end
+
+-- Decodes a JSON object, or returns nil.
+local function decode_object(text)
+    local ok, value = catch fromjson(text)
+    if ok and type(value) == "table" then
+        return value
+    end
+    return nil
+end
+
+--- Loads the discovery document of the issuer and returns the provider.
+---
+--- A provider that needs discovery calls it by itself, so a program calls
+--- it only to fail early, at startup. The first call fetches
+--- `ISSUER/.well-known/openid-configuration` and fills the endpoints that
+--- the options left out. Later calls, and calls on a provider whose
+--- endpoints are all set, send nothing.
+---
+--- A request that fails raises the `"network"` error. A status other than
+--- 200, a body that is not a JSON object, and a document whose `issuer`
+--- differs from the issuer of the provider each raise the `"response"`
+--- error.
+--- @return table The provider.
+function Provider:discover()
+    if self.discovered then
+        return self
+    end
+    local url = `$(self.issuer)/.well-known/openid-configuration`
+    local status, body = send(self, "GET", url, { accept = "application/json" })
+    if status ~= 200 then
+        raise("response", `discovery answered with status $status`, { status = status })
+    end
+    local document = decode_object(body)
+    if document == nil then
+        raise("response", "the discovery document is not a JSON object", { status = status })
+    end
+    if document.issuer ~= self.issuer then
+        raise("response", "the discovery document names another issuer", { status = status })
+    end
+    for _, endpoint in ipairs(ENDPOINTS) do
+        if self[endpoint] == nil and type(document[endpoint]) == "string" then
+            self[endpoint] = document[endpoint]
+        end
+    end
+    self.discovered = true
+    return self
+end
+
+-- Authorization -----------------------------------------------------------------
+
+local function scope_text(scope)
+    if type(scope) == "table" then
+        return table.concat(scope, " ")
+    end
+    return scope or ""
+end
+
+local function has_scope(scope, wanted)
+    for word in scope:gmatch("%S+") do
+        if word == wanted then
+            return true
+        end
+    end
+    return false
+end
+
+--- Returns the authorization URL and the flow of one sign-in.
+---
+--- The application redirects the browser of the user to the URL. It stores
+--- the flow on its own side, for example in the session of the user, then
+--- passes it to `provider:exchange` in the callback request. The flow is a
+--- table of strings: `state`, a random value that ties the callback to this
+--- browser, `verifier`, the PKCE code verifier, `nonce`, and `redirect`.
+--- Each of the three random values encodes 32 random bytes. The URL carries
+--- the `state`, the S256 challenge of the verifier, and the `nonce`. The
+--- verifier itself appears in the flow alone and must stay secret, so the
+--- flow belongs in server-side storage or in an encrypted cookie.
+---
+--- The flow has a `nonce` when the scopes include `openid`, and always
+--- with the `"apple"` preset. `provider:exchange` then requires an ID token
+--- with that nonce.
+---
+--- The options are the following.
+---
+--- - `scope`: the scopes of this request, in place of those of the provider.
+--- - `redirect`: the redirect URI, in place of that of the provider.
+--- - `state`: the state to use, in place of a random one.
+--- - `params`: a table of further query parameters, such as `prompt`,
+---   `login_hint`, or `access_type`. They replace generated parameters of
+---   the same name.
+---
+--- A provider with no redirect URI in either place raises an error.
+--- Discovery, when the provider needs it, raises the errors of
+--- `provider:discover`.
+--- @param options table? The options.
+--- @return string The URL.
+--- @return table The flow.
+function Provider:authorize_url(options)
+    options = options or {}
+    self:discover()
+    if self.authorization_endpoint == nil then
+        error("oauth: the provider has no authorization_endpoint", 2)
+    end
+    local redirect = options.redirect or self.redirect
+    if type(redirect) ~= "string" then
+        error("oauth: authorize_url needs a redirect URI", 2)
+    end
+    local scope = scope_text(options.scope or self.scope)
+    local flow = { state = options.state or random_token(), redirect = redirect }
+    local query = {
+        response_type = "code",
+        client_id = self.client_id,
+        redirect_uri = redirect,
+        state = flow.state,
+    }
+    if scope ~= "" then
+        query.scope = scope
+        if self.form_post then
+            query.response_mode = "form_post"
+        end
+    end
+    if self.pkce then
+        flow.verifier = random_token()
+        query.code_challenge = M.challenge(flow.verifier)
+        query.code_challenge_method = "S256"
+    end
+    if self.always_nonce or has_scope(scope, "openid") then
+        flow.nonce = random_token()
+        query.nonce = flow.nonce
+    end
+    for name, value in pairs(options.params or {}) do
+        query[name] = value
+    end
+    local endpoint = self.authorization_endpoint
+    local url = `$endpoint$(endpoint:find("?", 1, true) and "&" or "?")$(encode_query(query))`
+    return url, flow
+end
+
+-- Keys --------------------------------------------------------------------------
+
+-- Fetches the JWKS document and keeps its key function.
+local function fetch_keys(self)
+    self.jwks_fetched = self.clock()
+    local status, body = send(self, "GET", self.jwks_uri, { accept = "application/json" })
+    if status ~= 200 then
+        raise("response", `the key set answered with status $status`, { status = status })
+    end
+    local ok, keys = catch jwt.jwks(body)
+    if not ok then
+        raise("response", "the key set is not a JWKS document", { status = status })
+    end
+    self.keys = keys
+    return keys
+end
+
+-- Returns the key of a token header. An unknown key fetches the key set
+-- again, at most once per cooldown.
+local function key_for(self, header)
+    local now = self.clock()
+    local keys = self.keys
+    if keys == nil or now - self.jwks_fetched >= self.jwks_ttl then
+        keys = fetch_keys(self)
+        return keys(header)
+    end
+    local key = keys(header)
+    if key == nil and now - self.jwks_fetched >= self.jwks_cooldown then
+        key = fetch_keys(self)(header)
+    end
+    return key
+end
+
+local HASH_OF = { ["256"] = "sha256", ["384"] = "sha384", ["512"] = "sha512" }
+
+-- Checks the at_hash claim: the left half of the hash of the access token.
+local function at_hash_matches(alg, at_hash, access_token)
+    local hash = alg == "EdDSA" and "sha512" or HASH_OF[alg:sub(3)]
+    local given = type(at_hash) == "string" and unb64url(at_hash)
+    if hash == nil or not given then
+        return false
+    end
+    local digest = string.transcode(crypto.hash(hash, access_token), "binary", "hex")
+    return crypto.equal(digest:sub(1, #digest // 2), string.transcode(given, "binary", "hex"))
+end
+
+--- Validates an ID token and returns its claims.
+---
+--- `provider:exchange` and `provider:refresh` call it for the ID token of
+--- a token response. The key comes from the JWKS document at the `jwks_uri`
+--- of the provider, which the provider fetches once and keeps for
+--- `jwks_ttl` seconds. A token whose `kid` matches no key makes the
+--- provider fetch the document again, at most once per `jwks_cooldown`
+--- seconds.
+---
+--- The token is valid when all of the following hold. Times allow the
+--- `leeway` of the provider.
+---
+--- - Its signature verifies with a key of the provider, under one of the
+---   asymmetric `algorithms` of the provider. The algorithm `none` and the
+---   HMAC algorithms are never accepted.
+--- - `iss` is the issuer of the provider.
+--- - `aud` contains the `client_id`. If `aud` lists several audiences, or
+---   the token has an `azp` claim, `azp` is the `client_id`.
+--- - `exp` is in the future. `iat` is present and is not in the future.
+--- - `sub` is a string.
+--- - `nonce` equals `options.nonce`, when that option is set.
+--- - `at_hash`, when the token has one and `options.access_token` is set,
+---   is the hash of that access token.
+--- - `auth_time` is at most `options.max_age` seconds old, when that option
+---   is set.
+---
+--- An invalid token raises the `"id_token"` error. A key request that fails
+--- raises the `"network"` or the `"response"` error. A provider without a
+--- `jwks_uri` or an issuer raises an error.
+--- @param token string The ID token.
+--- @param options table? The options `nonce`, `access_token`, and `max_age`.
+--- @return table The claims.
+--- @return table The header.
+function Provider:verify_id_token(token, options)
+    options = options or {}
+    self:discover()
+    if self.jwks_uri == nil or self.issuer == nil then
+        error("oauth: verifying an ID token needs an issuer and a jwks_uri", 2)
+    end
+    local issuer = self.issuer
+    local ok, claims, header = catch jwt.verify(token, function(h) return key_for(self, h) end, {
+        algorithms = self.algorithms,
+        issuer = type(issuer) == "string" and issuer or nil,
+        audience = self.client_id,
+        leeway = self.leeway,
+        clock = self.clock,
+    })
+    if not ok then
+        if jwt.iserror(claims) then
+            raise("id_token", "invalid ID token: " .. claims.message, { cause = claims })
+        end
+        error(claims, 0)
+    end
+    local function reject(message)
+        raise("id_token", "invalid ID token: " .. message)
+    end
+    if type(issuer) == "function" then
+        local expected = issuer(claims)
+        if expected == nil or claims.iss ~= expected then
+            reject("unexpected issuer")
+        end
+    end
+    local now = self.clock()
+    if type(claims.exp) ~= "number" then
+        reject("exp is missing")
+    end
+    if type(claims.iat) ~= "number" then
+        reject("iat is missing")
+    end
+    if claims.iat > now + self.leeway then
+        reject("iat is in the future")
+    end
+    if type(claims.sub) ~= "string" then
+        reject("sub is missing")
+    end
+    local aud = claims.aud
+    if type(aud) == "table" and #aud > 1 and claims.azp == nil then
+        reject("azp is missing")
+    end
+    if claims.azp ~= nil and claims.azp ~= self.client_id then
+        reject("unexpected azp")
+    end
+    if options.nonce ~= nil then
+        if type(claims.nonce) ~= "string" or not crypto.equal(claims.nonce, options.nonce) then
+            reject("unexpected nonce")
+        end
+    end
+    if options.access_token ~= nil and claims.at_hash ~= nil then
+        if not at_hash_matches(header.alg, claims.at_hash, options.access_token) then
+            reject("at_hash does not fit the access token")
+        end
+    end
+    if options.max_age ~= nil then
+        if type(claims.auth_time) ~= "number" or now - claims.auth_time > options.max_age + self.leeway then
+            reject("the authentication is older than max_age")
+        end
+    end
+    return claims, header
+end
+
+-- Tokens ------------------------------------------------------------------------
+
+-- Posts a grant to the token endpoint and returns the decoded response.
+local function token_request(self, fields)
+    self:discover()
+    if self.token_endpoint == nil then
+        error("oauth: the provider has no token_endpoint", 3)
+    end
+    local headers = {
+        ["content-type"] = "application/x-www-form-urlencoded",
+        accept = "application/json",
+    }
+    local secret = SECRETS[self]
+    if type(secret) == "function" then
+        secret = secret()
+    end
+    if secret == nil then
+        fields.client_id = self.client_id
+    elseif self.auth == "post" then
+        fields.client_id = self.client_id
+        fields.client_secret = secret
+    else
+        local pair = `$(escape(self.client_id)):$(escape(secret))`
+        headers.authorization = "Basic " .. string.transcode(pair, "binary", "base64")
+    end
+    local status, body = send(self, "POST", self.token_endpoint, headers, encode_query(fields))
+    local tokens = decode_object(body)
+    if tokens ~= nil and type(tokens.error) == "string" then
+        local description = tokens.error_description
+        raise("provider", `the provider refused the request: $(tokens.error)`, {
+            error = tokens.error,
+            description = type(description) == "string" and description or nil,
+            status = status,
+        })
+    end
+    if status < 200 or status >= 300 then
+        raise("response", `the token endpoint answered with status $status`, { status = status })
+    end
+    if tokens == nil then
+        raise("response", "the token response is not a JSON object", { status = status })
+    end
+    if type(tokens.access_token) ~= "string" then
+        raise("response", "the token response has no access token", { status = status })
+    end
+    if type(tokens.expires_in) == "number" then
+        tokens.expires_at = self.clock() + tokens.expires_in
+    end
+    return tokens
+end
+
+--- Trades the code of a callback for tokens.
+---
+--- `params` is the table of parameters that the provider sent to the
+--- redirect URI: the query of the callback request, or its form body with
+--- the `"apple"` preset when the request named scopes. `flow` is the flow
+--- that `provider:authorize_url` returned for this browser.
+---
+--- The call first compares `params.state` with `flow.state` in constant
+--- time. It then posts the code to the token endpoint with the redirect URI
+--- and the PKCE verifier of the flow, and with the client credentials in
+--- the form that `auth` names. The result is the decoded token response: a
+--- table with `access_token`, usually `token_type`, `expires_in`,
+--- `refresh_token`, `scope`, and `id_token`, and every other field that the
+--- provider sent. The call adds `expires_at`, the time in seconds at which
+--- the access token expires, when the response has `expires_in`. It adds
+--- `claims`, the validated claims of the ID token, when the response has an
+--- ID token and the provider has a `jwks_uri`.
+---
+--- The errors are the following, in the order of the checks.
+---
+--- - A state that is missing or different raises the `"state"` error.
+--- - An `error` parameter raises the `"provider"` error with its `error`
+---   and `description`.
+--- - An `iss` parameter that differs from the issuer of the provider, and a
+---   missing `code`, each raise the `"response"` error.
+--- - A token response with an `error` field raises the `"provider"` error.
+---   Any other status outside 200 to 299, a body that is not a JSON object,
+---   and a response without an access token each raise the `"response"`
+---   error.
+--- - An invalid ID token, and a missing one when the flow has a `nonce`,
+---   raise the `"id_token"` error. `provider:verify_id_token` lists the
+---   checks.
+--- @param params table The parameters of the callback.
+--- @param flow table The flow of `provider:authorize_url`.
+--- @return table The tokens.
+function Provider:exchange(params, flow)
+    if type(params) ~= "table" then
+        error("oauth: exchange needs the table of callback parameters", 2)
+    end
+    if type(flow) ~= "table" or type(flow.state) ~= "string" then
+        error("oauth: exchange needs the flow of authorize_url", 2)
+    end
+    if type(params.state) ~= "string" or not crypto.equal(params.state, flow.state) then
+        raise("state", "the state of the callback does not match the flow")
+    end
+    if params.error ~= nil then
+        local description = params.error_description
+        raise("provider", `the provider refused the request: $(tostring(params.error))`, {
+            error = tostring(params.error),
+            description = type(description) == "string" and description or nil,
+        })
+    end
+    if params.iss ~= nil and type(self.issuer) == "string" and params.iss ~= self.issuer then
+        raise("response", "the callback names another issuer")
+    end
+    if type(params.code) ~= "string" or params.code == "" then
+        raise("response", "the callback has no code")
+    end
+    local tokens = token_request(self, {
+        grant_type = "authorization_code",
+        code = params.code,
+        redirect_uri = flow.redirect or self.redirect,
+        code_verifier = flow.verifier,
+    })
+    if type(tokens.id_token) == "string" and self.jwks_uri ~= nil and self.issuer ~= nil then
+        tokens.claims = self:verify_id_token(tokens.id_token, {
+            nonce = flow.nonce, access_token = tokens.access_token,
+        })
+    elseif flow.nonce ~= nil then
+        raise("id_token", "the token response has no ID token to validate")
+    end
+    return tokens
+end
+
+--- Trades a refresh token for new tokens.
+---
+--- The result has the shape of the result of `provider:exchange`. A
+--- response without a `refresh_token` keeps the one that was sent, so the
+--- result always has the refresh token to use next. A response with an ID
+--- token has it validated, without a nonce, into `claims`.
+---
+--- `options.scope` asks for a subset of the scopes that the user granted.
+--- The errors are those of the token request and of the ID token in
+--- `provider:exchange`. A provider answers a refresh token that expired or
+--- was revoked with the `"provider"` error whose `error` is
+--- `"invalid_grant"`.
+--- @param refresh_token string|table The refresh token, or a tokens table that holds one.
+--- @param options table? The options.
+--- @return table The tokens.
+function Provider:refresh(refresh_token, options)
+    if type(refresh_token) == "table" then
+        refresh_token = refresh_token.refresh_token
+    end
+    if type(refresh_token) ~= "string" then
+        error("oauth: refresh needs a refresh token", 2)
+    end
+    local fields = { grant_type = "refresh_token", refresh_token = refresh_token }
+    if options and options.scope then
+        fields.scope = scope_text(options.scope)
+    end
+    local tokens = token_request(self, fields)
+    if tokens.refresh_token == nil then
+        tokens.refresh_token = refresh_token
+    end
+    if type(tokens.id_token) == "string" and self.jwks_uri ~= nil and self.issuer ~= nil then
+        tokens.claims = self:verify_id_token(tokens.id_token, { access_token = tokens.access_token })
+    end
+    return tokens
+end
+
+--- Fetches the profile of the user from the userinfo endpoint.
+---
+--- The request carries the access token as a bearer token. The result is
+--- the decoded JSON object of the response, whose fields depend on the
+--- provider: an OpenID Connect provider returns claims such as `sub`,
+--- `email`, and `name`, GitHub returns `id` and `login`, and Discord
+--- returns `id` and `username`.
+---
+--- `tokens` is an access token or the tokens table of `provider:exchange`.
+--- With a tokens table that has `claims`, a profile whose `sub` differs
+--- from the `sub` of the ID token raises the `"response"` error.
+---
+--- A status of 400 or more raises the `"provider"` error with the status
+--- and, when the body is JSON with an `error` field, that error. A body
+--- that is not a JSON object raises the `"response"` error. A provider
+--- without a userinfo endpoint raises an error.
+--- @param tokens string|table The access token, or the tokens table.
+--- @return table The profile.
+function Provider:userinfo(tokens)
+    local access_token, claims = tokens, nil
+    if type(tokens) == "table" then
+        access_token, claims = tokens.access_token, tokens.claims
+    end
+    if type(access_token) ~= "string" then
+        error("oauth: userinfo needs an access token", 2)
+    end
+    self:discover()
+    if self.userinfo_endpoint == nil then
+        error("oauth: the provider has no userinfo_endpoint", 2)
+    end
+    local status, body = send(self, "GET", self.userinfo_endpoint, {
+        authorization = "Bearer " .. access_token,
+        accept = "application/json",
+    })
+    local profile = decode_object(body)
+    if status >= 400 then
+        local code = profile and type(profile.error) == "string" and profile.error or "userinfo"
+        raise("provider", `the userinfo endpoint answered with status $status`, { error = code, status = status })
+    end
+    if profile == nil then
+        raise("response", "the userinfo response is not a JSON object", { status = status })
+    end
+    if claims ~= nil and profile.sub ~= nil and profile.sub ~= claims.sub then
+        raise("response", "the userinfo response describes another user", { status = status })
+    end
+    return profile
+end
+
+return M

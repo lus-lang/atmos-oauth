@@ -1,0 +1,1124 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
+pledge("load", `fs:read=$PACKAGES/*`)
+package.path = `$ROOT/?.lus;$PACKAGES/jwt/?.lus;$PACKAGES/atmos-jwt/?.lus;$(package.path)`
+-- The package requires jwt by its atmosphere URL. The tests load the
+-- checkout next to this one in its place.
+package.preload["https://atmosp.here/2.0/jwt.lus"] = function() return require("jwt") end
+
+local oauth = require("oauth")
+local jwt = require("jwt")
+
+-- This RSA key exists only for the tests. It was generated with
+-- "openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048" and protects
+-- nothing.
+local RSA_PRIVATE = [[
+-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDH0ArVv/oc7R9A
+H0onz6zKUceBam/muQTPN8l4Ttxgp9KVc0GZj87yQBHSAMt1ZMAet/hl2LZU5l+E
+qU5IDUktL88HwvXYivudtRTIDpggvhb3CUg2RpAwuo/OGABc5AYzmM0hFH7HI478
+qmJLIK9X5UbAZbiR/ahsKC66hRfYwSAZ0JEiwCa+gIvU2SV7VWMaO/tMqQmt8+3N
+/RqcGMkNcmKheXBEUgRVFpPtvACv5vxIEpBaXs2YvjDHhIelwOaflG8rXgp1XGvp
+IwOKnnNWFEWuwlsb/b1H9jWI0uPBWZidAW9Y18XGLjm9lHqN9MlATcKeVMSErO7u
+fQK34xvvAgMBAAECggEAfw4KJbsqRoR9b5+13rTOsePokaFlwHd72Gwn3yl+NrPg
+Uwnz97qbJC2bZ0b8GQzUoXPoLpLr9fZ7XHbwAR75nhMdeVj+TRCrSLAho8ir8X4O
+Sk2Lrn+WJnYrBSj76hVQ4DRUk6ldqDEzNfT+Bbml5aU0JRlJkQOTuhqfBBmnfTrH
+0FLH1owpck8lVOQGG/NKjjlXIBGf9nRd5GNBPrDUxZLz5FOzbqcfLsWlXin9jyiS
+/luiuPAmAK+i+XF8J2FcfG5I9nohIqwDQpsA91W8XDOrA4WlmRXbO+N1zhdeNJ8R
+Dl9vVHOZV5/Iunc9mnueqKDkyU7gVzSshPvzmB0s2QKBgQD4d8Y1l4iqJlXWt4uh
+f1qMZvote31MyJ+9Ghm7Ik87RpUnsHZmyigmj5TWKuvDxboQk5pfeWEvpoUnaRny
+7TY2qkd0RckWUOFQpoRt9HqwTIIPtRwHslkXmsXyrefGvRh+N0AF2noz8Jjtce23
+XEKijPuRjrRhKHynfNuraoRzPQKBgQDN3q5gYFtIShjboZqUkIj/l2lCPOpmaDeX
+lpjdr3Piy1tAnBra7EFbv35pLaOfX/ld/0N7oVySGnZMHm74NWoyjg/OFBWUX5Hz
+9ZC7/aiIqQOluotIh19v+0ZgyXPeU6IihBMd34fj+Mz1S75mi80QJdMNXMkWjYeU
+cwWWDzQOmwKBgA72z7YskSuGMYdD+KHaVK6+CPUyScKVFqHB76jIkTMFtjf0tbzN
+Egv4e8NGRHq+7szOxu5XFhZTlhNgjhKGXMyABtum1EyGxHsh/DnPDpCNmwutIaoJ
+ALqeNKu/84SRoOcBFtcDaHa2V899HA79/Hljukby7EQptxAzQduaB64VAoGAIcP9
+O8dyEVg93YAS930BS1KNLBULqQI84/sKVYnaav9Jlz5DVVbcnWy6EgwvQwudveIJ
+MnTT1w7KClAPiVxRb7tHMliu9Wf7a1UCiSLgipGWDI+dGqdBav9+mo9QFs4G0Lxy
+2jp4clazXyQuNWmGl7hsdkuam71Y2GtJJkSWGDMCgYAI7viiErGZm7b39eShyBBC
+Ab1w9MG2FUfg55Xvgvy+JPdODUUQqvaf6Aw/x4m8YJeGRZIqz9bX8DBMbJ8DIZfR
++U2vbrCJ72OU7EI17Xh9MZntaQFyWCZVXYMnKiau6kFCMswIVLncnhEPR+i0eCzK
+lHYt9XaEaiAcvzpn++K9gg==
+-----END PRIVATE KEY-----
+]]
+
+local NOW = 1800000000
+local function clock() return NOW end
+
+local CLIENT_ID = "client-1"
+local CLIENT_SECRET = "s3cret/with+odd:chars"
+local REDIRECT = "https://app.example/callback"
+
+local function b64url(data)
+    return (string.transcode(data, "binary", "base64"):gsub("=+$", ""):gsub("+", "-"):gsub("/", "_"))
+end
+
+local function unhex(hex)
+    return string.char(tonumber(hex, 16))
+end
+
+local function unescape(text)
+    return (text:gsub("+", " "):gsub("%%(%x%x)", unhex))
+end
+
+local function parse_query(text)
+    local out = {}
+    for name, value in text:gmatch("([^&=]+)=([^&]*)") do
+        out[unescape(name)] = unescape(value)
+    end
+    return out
+end
+
+local function query_of(url)
+    return parse_query(url:match("%?(.*)$"))
+end
+
+local function error_of(fn, ...)
+    local ok, err = catch fn(...)
+    assert(not ok, "expected an error")
+    assert(oauth.is_error(err), tostring(err))
+    return err
+end
+
+-- The fake provider ---------------------------------------------------------------
+
+-- Builds an identity provider that lives in memory. It answers the requests
+-- of the package through `idp.fetch`, and `idp:authorize` plays the browser
+-- of a user who approves the request. The fields `tamper`, `sign_key`,
+-- `sign_options`, `raw_id_token`, and `token_reply` let a test make it
+-- misbehave.
+local function new_idp(issuer)
+    local idp = {
+        issuer = issuer or "https://idp.example",
+        auth_methods = { basic = true, post = true },
+        client_secret = CLIENT_SECRET,
+        codes = {}, refresh_tokens = {}, access_tokens = {},
+        requests = {}, hits = { discovery = 0, jwks = 0, token = 0, userinfo = 0 },
+        counter = 0,
+        user = { sub = "user-42", email = "ada@example.com", name = "Ada" },
+    }
+    local secret, public = crypto.keypair("P-256")
+    idp.kid = "ec-1"
+    idp.sign_key = secret
+    idp.public_keys = { [idp.kid] = public }
+
+    function idp:rotate(kid)
+        local new_secret, new_public = crypto.keypair("P-256")
+        self.kid, self.sign_key = kid, new_secret
+        self.public_keys = { [kid] = new_public }
+    end
+
+    function idp:use_rsa()
+        local key = crypto.importkey(RSA_PRIVATE)
+        self.kid, self.sign_key = "rsa-1", key
+        self.public_keys = { ["rsa-1"] = key:public() }
+        self.sign_options = { alg = "RS256" }
+    end
+
+    function idp:jwks()
+        local keys = {}
+        for kid, key in pairs(self.public_keys) do
+            local jwk = key:export("jwk")
+            jwk.kid, jwk.use = kid, "sig"
+            keys[#keys + 1] = jwk
+        end
+        return { keys = keys }
+    end
+
+    function idp:id_token(grant, access_token)
+        if self.raw_id_token then
+            return self.raw_id_token(grant)
+        end
+        local digest = crypto.hash("sha256", access_token)
+        local half = vector.create(16)
+        for i = 0, 15 do
+            vector.set(half, i, vector.get(digest, i))
+        end
+        local claims = {
+            iss = self.id_token_issuer or self.issuer, aud = grant.client_id, sub = self.user.sub,
+            email = self.user.email, nonce = grant.nonce, iat = NOW, exp = NOW + 300,
+            at_hash = b64url(half),
+        }
+        local options = { clock = clock, iat = false, header = { kid = self.kid } }
+        for k, v in pairs(self.sign_options or {}) do
+            options[k] = v
+        end
+        local key = self.sign_key
+        if self.tamper then
+            key = self.tamper(claims, options) or key
+        end
+        return jwt.sign(claims, key, options)
+    end
+
+    function idp:issue(grant)
+        self.counter = self.counter + 1
+        local access_token = `at-$(self.counter)`
+        local refresh_token = `rt-$(self.counter)`
+        self.access_tokens[access_token] = grant
+        self.refresh_tokens[refresh_token] = grant
+        local reply = {
+            access_token = access_token, token_type = "Bearer", expires_in = 3600,
+            refresh_token = refresh_token, scope = grant.scope,
+        }
+        if grant.scope and grant.scope:find("openid", 1, true) or self.always_id_token then
+            reply.id_token = self:id_token(grant, access_token)
+        end
+        return reply
+    end
+
+    -- Plays the browser: reads the authorization URL, approves it, and
+    -- returns the parameters of the callback.
+    function idp:authorize(url)
+        local query = query_of(url)
+        assert(query.response_type == "code" and query.client_id ~= nil)
+        self.counter = self.counter + 1
+        local code = `code-$(self.counter)`
+        self.codes[code] = {
+            client_id = query.client_id, redirect_uri = query.redirect_uri, scope = query.scope,
+            challenge = query.code_challenge, method = query.code_challenge_method, nonce = query.nonce,
+        }
+        return { code = code, state = query.state }
+    end
+
+    local function json(status, value)
+        return status, tojson(value), { ["content-type"] = "application/json" }
+    end
+
+    local function client_of(headers, form)
+        local basic = headers.authorization and headers.authorization:match("^Basic (.+)$")
+        if basic and idp.auth_methods.basic then
+            local pair = vector.tostring(string.transcode(basic, "base64", "binary"))
+            local id, client_secret = pair:match("^([^:]*):(.*)$")
+            if unescape(client_secret) == idp.client_secret then
+                return unescape(id)
+            end
+        elseif form.client_secret and idp.auth_methods.post then
+            if form.client_secret == idp.client_secret or idp.check_secret and idp.check_secret(form.client_secret) then
+                return form.client_id
+            end
+        elseif idp.public and form.client_secret == nil and basic == nil then
+            return form.client_id
+        end
+        return nil
+    end
+
+    local function token_endpoint(method, headers, body)
+        if method ~= "POST" or headers["content-type"] ~= "application/x-www-form-urlencoded" then
+            return json(400, { error = "invalid_request" })
+        end
+        local form = parse_query(body)
+        local client = client_of(headers, form)
+        if client == nil then
+            return json(401, { error = "invalid_client" })
+        end
+        if form.grant_type == "authorization_code" then
+            local grant = idp.codes[form.code]
+            idp.codes[form.code or ""] = nil
+            if grant == nil or grant.client_id ~= client or grant.redirect_uri ~= form.redirect_uri then
+                return json(400, { error = "invalid_grant", error_description = "unknown code" })
+            end
+            if grant.challenge ~= nil then
+                if grant.method ~= "S256" or form.code_verifier == nil
+                    or oauth.challenge(form.code_verifier) ~= grant.challenge
+                then
+                    return json(400, { error = "invalid_grant", error_description = "PKCE failed" })
+                end
+            end
+            return json(200, idp:issue(grant))
+        elseif form.grant_type == "refresh_token" then
+            local grant = idp.refresh_tokens[form.refresh_token]
+            if grant == nil or grant.client_id ~= client then
+                return json(400, { error = "invalid_grant" })
+            end
+            local reply = idp:issue({ client_id = grant.client_id, scope = form.scope or grant.scope })
+            if idp.rotate_refresh then
+                idp.refresh_tokens[form.refresh_token] = nil
+            else
+                idp.refresh_tokens[reply.refresh_token] = nil
+                reply.refresh_token = nil
+            end
+            return json(200, reply)
+        end
+        return json(400, { error = "unsupported_grant_type" })
+    end
+
+    function idp.handle(method, path, headers, body)
+        idp.requests[#idp.requests + 1] = { method = method, path = path, headers = headers, body = body }
+        if path:find("/.well-known/openid-configuration", 1, true) then
+            idp.hits.discovery = idp.hits.discovery + 1
+            if idp.discovery_reply then
+                return idp.discovery_reply()
+            end
+            return json(200, {
+                issuer = idp.issuer,
+                authorization_endpoint = idp.issuer .. "/authorize",
+                token_endpoint = idp.issuer .. "/token",
+                userinfo_endpoint = idp.issuer .. "/userinfo",
+                jwks_uri = idp.issuer .. "/jwks",
+            })
+        elseif path:find("/jwks$") or path:find("/keys$") or path:find("/certs$") then
+            idp.hits.jwks = idp.hits.jwks + 1
+            return json(200, idp:jwks())
+        elseif path:find("/token$") or path:find("/access_token$") then
+            idp.hits.token = idp.hits.token + 1
+            if idp.token_reply then
+                return idp.token_reply()
+            end
+            return token_endpoint(method, headers, body)
+        elseif path:find("/userinfo$") or path:find("/user$") or path:find("/users/@me$") then
+            idp.hits.userinfo = idp.hits.userinfo + 1
+            local token = headers.authorization and headers.authorization:match("^Bearer (.+)$")
+            if token == nil or idp.access_tokens[token] == nil then
+                return json(401, { error = "invalid_token" })
+            end
+            return json(200, idp.userinfo_reply or idp.user)
+        end
+        return 404, "not found", {}
+    end
+
+    function idp.fetch(url, method, headers, body)
+        local path = url:match("^https?://[^/]*([^?]*)")
+        local status, text, reply_headers = idp.handle(method or "GET", path, headers or {}, body or "")
+        return status, vector.fromstring(text), reply_headers
+    end
+
+    return idp
+end
+
+-- A provider that discovers the fake, with the options of a test on top.
+local function new_client(idp, extra)
+    local options = {
+        issuer = idp.issuer, client_id = CLIENT_ID, client_secret = CLIENT_SECRET, redirect = REDIRECT,
+        scope = { "openid", "email" }, fetch = idp.fetch, clock = clock,
+    }
+    for k, v in pairs(extra or {}) do
+        options[k] = v
+    end
+    return oauth.provider(options)
+end
+
+local function sign_in(idp, client, options)
+    local url, flow = client:authorize_url(options)
+    return client:exchange(idp:authorize(url), flow), flow
+end
+
+-- Authorization URLs ----------------------------------------------------------------
+
+local function challenge_matches_rfc7636_test()
+    -- The example of RFC 7636, appendix B.
+    assert(oauth.challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
+end
+
+local function authorize_url_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local url, flow = client:authorize_url()
+    assert(url:find("https://idp.example/authorize?", 1, true) == 1)
+    local query = query_of(url)
+    assert(query.response_type == "code" and query.client_id == CLIENT_ID and query.redirect_uri == REDIRECT)
+    assert(query.scope == "openid email" and query.state == flow.state and query.nonce == flow.nonce)
+    assert(query.code_challenge_method == "S256" and query.code_challenge == oauth.challenge(flow.verifier))
+    assert(url:find("scope=openid%20email", 1, true) and url:find("redirect_uri=https%3A%2F%2Fapp.example%2Fcallback", 1, true))
+    for _, name in ipairs({ "state", "verifier", "nonce" }) do
+        assert(#flow[name] == 43 and not flow[name]:find("[^%w%-_]"), name)
+    end
+    assert(flow.redirect == REDIRECT)
+    assert(idp.hits.discovery == 1)
+end
+
+local function flows_are_unique_test()
+    local client = new_client(new_idp())
+    local seen = {}
+    for _ = 1, 20 do
+        local _, flow = client:authorize_url()
+        for _, name in ipairs({ "state", "verifier", "nonce" }) do
+            assert(not seen[flow[name]])
+            seen[flow[name]] = true
+        end
+    end
+end
+
+local function verifier_stays_out_of_the_url_test()
+    local client = new_client(new_idp())
+    local url, flow = client:authorize_url()
+    assert(not url:find(flow.verifier, 1, true))
+    assert(not url:find(CLIENT_SECRET, 1, true) and not url:find("secret", 1, true))
+end
+
+local function authorize_url_options_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local url, flow = client:authorize_url({
+        scope = "profile", state = "my-state", redirect = "https://other.example/cb",
+        params = { prompt = "consent", login_hint = "ada@example.com" },
+    })
+    local query = query_of(url)
+    assert(query.scope == "profile" and query.state == "my-state" and flow.state == "my-state")
+    assert(query.redirect_uri == "https://other.example/cb" and flow.redirect == "https://other.example/cb")
+    assert(query.prompt == "consent" and query.login_hint == "ada@example.com")
+    -- Without the openid scope the flow has no nonce.
+    assert(query.nonce == nil and flow.nonce == nil)
+
+    local plain = new_client(idp, { pkce = false })
+    url, flow = plain:authorize_url()
+    assert(flow.verifier == nil and not url:find("code_challenge", 1, true))
+
+    local homeless = oauth.provider({ issuer = idp.issuer, client_id = "c", fetch = idp.fetch })
+    assert(not catch homeless:authorize_url())
+end
+
+-- The code flow -----------------------------------------------------------------------
+
+local function code_flow_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local tokens = sign_in(idp, client)
+    assert(tokens.access_token == "at-2" and tokens.refresh_token == "rt-2" and tokens.token_type == "Bearer")
+    assert(tokens.expires_at == NOW + 3600 and tokens.scope == "openid email")
+    assert(tokens.claims.sub == "user-42" and tokens.claims.email == "ada@example.com")
+    assert(tokens.claims.iss == idp.issuer and tokens.claims.aud == CLIENT_ID)
+    assert(idp.hits.discovery == 1 and idp.hits.jwks == 1 and idp.hits.token == 1)
+end
+
+local function code_is_single_use_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local url, flow = client:authorize_url()
+    local params = idp:authorize(url)
+    client:exchange(params, flow)
+    local err = error_of(client.exchange, client, params, flow)
+    assert(err.code == "provider" and err.error == "invalid_grant" and err.description == "unknown code" and err.status == 400)
+end
+
+local function rsa_signed_id_token_test()
+    local idp = new_idp()
+    idp:use_rsa()
+    local tokens = sign_in(idp, new_client(idp))
+    assert(tokens.claims.sub == "user-42")
+    assert(jwt.decode(tokens.id_token).alg == "RS256")
+end
+
+local function client_secret_basic_test()
+    local idp = new_idp()
+    idp.auth_methods = { basic = true }
+    sign_in(idp, new_client(idp))
+    local request = idp.requests[#idp.requests - 1]
+    assert(request.path == "/token")
+    local pair = vector.tostring(string.transcode(request.headers.authorization:match("^Basic (.+)$"), "base64", "binary"))
+    assert(pair == "client-1:s3cret%2Fwith%2Bodd%3Achars")
+    local form = parse_query(request.body)
+    assert(form.client_secret == nil and form.client_id == nil and form.grant_type == "authorization_code")
+    assert(request.headers.accept == "application/json")
+end
+
+local function client_secret_post_test()
+    local idp = new_idp()
+    idp.auth_methods = { post = true }
+    sign_in(idp, new_client(idp, { auth = "post" }))
+    local request = idp.requests[#idp.requests - 1]
+    local form = parse_query(request.body)
+    assert(request.headers.authorization == nil)
+    assert(form.client_id == CLIENT_ID and form.client_secret == CLIENT_SECRET)
+    -- The wrong method fails at the provider.
+    local err = error_of(sign_in, idp, new_client(idp, { auth = "basic" }))
+    assert(err.code == "provider" and err.error == "invalid_client" and err.status == 401)
+end
+
+local function client_secret_function_test()
+    local idp = new_idp()
+    local calls = 0
+    local client = new_client(idp, {
+        client_secret = function()
+            calls = calls + 1
+            return CLIENT_SECRET
+        end,
+    })
+    sign_in(idp, client)
+    sign_in(idp, client)
+    assert(calls == 2)
+end
+
+local function public_client_test()
+    local idp = new_idp()
+    idp.public = true
+    local client = oauth.provider({
+        issuer = idp.issuer, client_id = CLIENT_ID, redirect = REDIRECT, scope = "openid",
+        fetch = idp.fetch, clock = clock,
+    })
+    local tokens = sign_in(idp, client)
+    assert(tokens.claims.sub == "user-42")
+    local form = parse_query(idp.requests[#idp.requests - 1].body)
+    assert(form.client_id == CLIENT_ID and form.client_secret == nil and form.code_verifier ~= nil)
+end
+
+-- Callback checks ---------------------------------------------------------------------
+
+local function state_mismatch_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local url, flow = client:authorize_url()
+    local params = idp:authorize(url)
+    local before = idp.hits.token
+    for _, state in ipairs({ "other", flow.state .. "x", flow.state:sub(1, -2), "" }) do
+        local err = error_of(client.exchange, client, { code = params.code, state = state }, flow)
+        assert(err.code == "state")
+    end
+    assert(error_of(client.exchange, client, { code = params.code }, flow).code == "state")
+    assert(error_of(client.exchange, client, { code = params.code, state = 42 }, flow).code == "state")
+    -- A wrong state reaches no endpoint and spends no code.
+    assert(idp.hits.token == before)
+    assert(client:exchange(params, flow).access_token)
+    assert(not catch client:exchange(params, {}))
+    assert(not catch client:exchange(params.code, flow))
+end
+
+local function callback_error_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local _, flow = client:authorize_url()
+    local err = error_of(client.exchange, client, {
+        state = flow.state, error = "access_denied", error_description = "The user said no",
+    }, flow)
+    assert(err.code == "provider" and err.error == "access_denied" and err.description == "The user said no")
+    assert(tostring(err) == "oauth: the provider refused the request: access_denied")
+    -- The state is checked before the error is believed.
+    assert(error_of(client.exchange, client, { state = "forged", error = "access_denied" }, flow).code == "state")
+    assert(error_of(client.exchange, client, { state = flow.state }, flow).code == "response")
+    assert(error_of(client.exchange, client, { state = flow.state, code = "c", iss = "https://evil.example" }, flow).code == "response")
+    assert(idp.hits.token == 0)
+end
+
+local function callback_issuer_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local url, flow = client:authorize_url()
+    local params = idp:authorize(url)
+    params.iss = idp.issuer
+    assert(client:exchange(params, flow).claims.sub == "user-42")
+end
+
+local function pkce_is_enforced_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local url, flow = client:authorize_url()
+    local params = idp:authorize(url)
+    -- A thief with the code and the state lacks the verifier.
+    local stolen = { state = flow.state, redirect = flow.redirect, nonce = flow.nonce, verifier = b64url(crypto.random(32)) }
+    local err = error_of(client.exchange, client, params, stolen)
+    assert(err.code == "provider" and err.description == "PKCE failed")
+    assert(not tostring(err):find(stolen.verifier, 1, true))
+end
+
+-- Token responses -----------------------------------------------------------------------
+
+local function token_error_with_status_200_test()
+    -- GitHub reports errors with status 200.
+    local idp = new_idp()
+    local client = new_client(idp)
+    idp.token_reply = function()
+        return 200, tojson({ error = "bad_verification_code", error_description = "The code is incorrect" }), {}
+    end
+    local err = error_of(sign_in, idp, client)
+    assert(err.code == "provider" and err.error == "bad_verification_code" and err.status == 200)
+end
+
+local function malformed_token_response_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local replies = {
+        function() return 200, "<html>busy</html>", {} end,
+        function() return 200, "[1,2]", {} end,
+        function() return 200, tojson({ token_type = "Bearer" }), {} end,
+        function() return 200, tojson({ access_token = 5 }), {} end,
+        function() return 503, "busy", {} end,
+        function() return 500, tojson({ message = "boom" }), {} end,
+    }
+    for i, reply in ipairs(replies) do
+        idp.token_reply = reply
+        local err = error_of(sign_in, idp, client)
+        assert(err.code == "response", i)
+        assert(err.status == (i < 5 and 200 or i == 5 and 503 or 500))
+    end
+end
+
+local function network_error_test()
+    local idp = new_idp()
+    local down = false
+    local client = new_client(idp, {
+        fetch = function(...)
+            if down then
+                error("cannot connect to idp.example:443: Connection refused")
+            end
+            return idp.fetch(...)
+        end,
+    })
+    local url, flow = client:authorize_url()
+    local params = idp:authorize(url)
+    down = true
+    local err = error_of(client.exchange, client, params, flow)
+    assert(err.code == "network" and tostring(err.cause):find("Connection refused", 1, true))
+    assert(not tostring(err):find(flow.verifier, 1, true) and not tostring(err):find(params.code, 1, true))
+end
+
+-- ID tokens -----------------------------------------------------------------------------
+
+local function id_token_error(idp, client)
+    local err = error_of(sign_in, idp, client or new_client(idp))
+    assert(err.code == "id_token", tostring(err))
+    return err
+end
+
+local function nonce_test()
+    local idp = new_idp()
+    idp.tamper = function(claims) claims.nonce = "replayed" end
+    assert(id_token_error(idp).message == "invalid ID token: unexpected nonce")
+    idp.tamper = function(claims) claims.nonce = nil end
+    assert(id_token_error(idp).message == "invalid ID token: unexpected nonce")
+    -- A flow with a nonce needs an ID token.
+    idp.token_reply = function() return 200, tojson({ access_token = "at" }), {} end
+    assert(id_token_error(idp).message == "the token response has no ID token to validate")
+end
+
+local function issuer_and_audience_test()
+    local idp = new_idp()
+    idp.tamper = function(claims) claims.iss = "https://evil.example" end
+    local err = id_token_error(idp)
+    assert(jwt.iserror(err.cause) and err.cause.code == "claim" and err.message:find("issuer", 1, true))
+    idp.tamper = function(claims) claims.aud = "another-client" end
+    assert(id_token_error(idp).message:find("audience", 1, true))
+    idp.tamper = function(claims) claims.aud = { "another-client", "third" } end
+    assert(id_token_error(idp).message:find("audience", 1, true))
+    idp.tamper = function(claims) claims.aud = nil end
+    assert(id_token_error(idp).message:find("audience", 1, true))
+end
+
+local function azp_test()
+    local idp = new_idp()
+    idp.tamper = function(claims) claims.aud = { CLIENT_ID, "api" } end
+    assert(id_token_error(idp).message == "invalid ID token: azp is missing")
+    idp.tamper = function(claims)
+        claims.aud = { CLIENT_ID, "api" }
+        claims.azp = "api"
+    end
+    assert(id_token_error(idp).message == "invalid ID token: unexpected azp")
+    idp.tamper = function(claims) claims.azp = "api" end
+    assert(id_token_error(idp).message == "invalid ID token: unexpected azp")
+    idp.tamper = function(claims)
+        claims.aud = { CLIENT_ID, "api" }
+        claims.azp = CLIENT_ID
+    end
+    assert(sign_in(idp, new_client(idp)).claims.azp == CLIENT_ID)
+    idp.tamper = function(claims) claims.aud = { CLIENT_ID } end
+    assert(sign_in(idp, new_client(idp)).claims.sub == "user-42")
+end
+
+local function times_and_clock_skew_test()
+    local idp = new_idp()
+    -- The default leeway is 60 seconds.
+    idp.tamper = function(claims) claims.exp = NOW - 59 end
+    assert(sign_in(idp, new_client(idp)).claims.exp == NOW - 59)
+    idp.tamper = function(claims) claims.exp = NOW - 60 end
+    assert(id_token_error(idp).cause.code == "expired")
+    idp.tamper = function(claims) claims.iat = NOW + 60 end
+    assert(sign_in(idp, new_client(idp)).claims.iat == NOW + 60)
+    idp.tamper = function(claims) claims.iat = NOW + 61 end
+    assert(id_token_error(idp).message == "invalid ID token: iat is in the future")
+    assert(sign_in(idp, new_client(idp, { leeway = 120 })).claims.sub == "user-42")
+    idp.tamper = function(claims) claims.iat = NOW + 1 end
+    assert(id_token_error(idp, new_client(idp, { leeway = 0 })).message == "invalid ID token: iat is in the future")
+    idp.tamper = function(claims) claims.exp = NOW end
+    assert(id_token_error(idp, new_client(idp, { leeway = 0 })).cause.code == "expired")
+    idp.tamper = function(claims) claims.nbf = NOW + 600 end
+    assert(id_token_error(idp).cause.code == "not_yet_valid")
+end
+
+local function required_claims_test()
+    local idp = new_idp()
+    idp.tamper = function(claims) claims.exp = nil end
+    assert(id_token_error(idp).message == "invalid ID token: exp is missing")
+    idp.tamper = function(claims) claims.iat = nil end
+    assert(id_token_error(idp).message == "invalid ID token: iat is missing")
+    idp.tamper = function(claims) claims.sub = nil end
+    assert(id_token_error(idp).message == "invalid ID token: sub is missing")
+    idp.tamper = function(claims) claims.sub = 42 end
+    assert(id_token_error(idp).message == "invalid ID token: sub is missing")
+end
+
+local function alg_none_is_refused_test()
+    local idp = new_idp()
+    local alg
+    idp.raw_id_token = function(grant)
+        local claims = { iss = idp.issuer, aud = grant.client_id, sub = "admin", nonce = grant.nonce, iat = NOW, exp = NOW + 300 }
+        return `$(b64url(tojson({ alg = alg, typ = "JWT", kid = idp.kid }))).$(b64url(tojson(claims))).`
+    end
+    for _, name in ipairs({ "none", "None", "NONE" }) do
+        alg = name
+        assert(id_token_error(idp).cause.code == "algorithm", name)
+    end
+    assert(not catch new_client(idp, { algorithms = { "none" } }))
+    assert(not catch new_client(idp, { algorithms = { "RS256", "HS256" } }))
+    assert(not catch new_client(idp, { algorithms = {} }))
+end
+
+local function hmac_id_token_is_refused_test()
+    local idp = new_idp()
+    idp:use_rsa()
+    local public_pem = crypto.importkey(RSA_PRIVATE):public():export("pem")
+    local secret
+    idp.raw_id_token = function(grant)
+        local claims = { iss = idp.issuer, aud = grant.client_id, sub = "admin", nonce = grant.nonce, iat = NOW, exp = NOW + 300 }
+        local input = `$(b64url(tojson({ alg = "HS256", typ = "JWT", kid = idp.kid }))).$(b64url(tojson(claims)))`
+        return `$input.$(b64url(crypto.hmac("sha256", secret, input)))`
+    end
+    -- Neither the client secret nor the public key of the provider works as
+    -- an HMAC secret.
+    for _, candidate in ipairs({ CLIENT_SECRET, public_pem }) do
+        secret = candidate
+        assert(id_token_error(idp).cause.code == "algorithm")
+    end
+end
+
+local function forged_signature_test()
+    local idp = new_idp()
+    local attacker = crypto.keypair("P-256")
+    -- The attacker signs with a key of their own under the kid of the provider.
+    idp.tamper = function() return attacker end
+    assert(id_token_error(idp).cause.code == "signature")
+    -- An algorithm outside the list of the provider is refused.
+    idp.tamper = nil
+    assert(id_token_error(idp, new_client(idp, { algorithms = { "RS256" } })).cause.code == "algorithm")
+    assert(sign_in(idp, new_client(idp, { algorithms = { "ES256" } })).claims.sub == "user-42")
+end
+
+local function at_hash_test()
+    local idp = new_idp()
+    idp.tamper = function(claims) claims.at_hash = b64url(crypto.random(16)) end
+    assert(id_token_error(idp).message == "invalid ID token: at_hash does not fit the access token")
+    idp.tamper = function(claims) claims.at_hash = nil end
+    assert(sign_in(idp, new_client(idp)).claims.at_hash == nil)
+end
+
+local function verify_id_token_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local grant = { client_id = CLIENT_ID, nonce = "n-1" }
+    idp.tamper = function(claims) claims.auth_time = NOW - 500 end
+    local token = idp:id_token(grant, "at-x")
+    local claims, header = client:verify_id_token(token, { nonce = "n-1", access_token = "at-x" })
+    assert(claims.sub == "user-42" and header.kid == "ec-1")
+    assert(client:verify_id_token(token).nonce == "n-1")
+    assert(client:verify_id_token(token, { max_age = 600 }))
+    assert(error_of(client.verify_id_token, client, token, { nonce = "n-2" }).code == "id_token")
+    assert(error_of(client.verify_id_token, client, token, { access_token = "at-y" }).code == "id_token")
+    assert(error_of(client.verify_id_token, client, token, { max_age = 300 }).code == "id_token")
+    assert(error_of(client.verify_id_token, client, "not.a.token").cause.code == "malformed")
+    assert(error_of(client.verify_id_token, client, 42).code == "id_token")
+end
+
+-- Key sets ------------------------------------------------------------------------------
+
+local function jwks_is_cached_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    for _ = 1, 5 do
+        sign_in(idp, client)
+    end
+    assert(idp.hits.jwks == 1 and idp.hits.discovery == 1 and idp.hits.token == 5)
+end
+
+local function jwks_refreshes_on_unknown_kid_test()
+    local idp = new_idp()
+    local client = new_client(idp, { jwks_cooldown = 60 })
+    local start = NOW
+    sign_in(idp, client)
+    assert(idp.hits.jwks == 1)
+    -- The provider rotates its key. Inside the cooldown the new kid stays unknown.
+    idp:rotate("ec-2")
+    NOW = start + 30
+    assert(id_token_error(idp, client).cause.code == "signature")
+    assert(idp.hits.jwks == 1)
+    -- After the cooldown one fetch finds the new key.
+    NOW = start + 61
+    assert(sign_in(idp, client).claims.sub == "user-42")
+    assert(idp.hits.jwks == 2)
+    sign_in(idp, client)
+    assert(idp.hits.jwks == 2)
+    NOW = start
+end
+
+local function unknown_kid_fetches_are_rate_limited_test()
+    local idp = new_idp()
+    local client = new_client(idp, { jwks_cooldown = 60 })
+    local start = NOW
+    sign_in(idp, client)
+    local stranger = crypto.keypair("P-256")
+    idp.tamper = function(_, options)
+        options.header = { kid = "made-up-" .. tostring(idp.counter) }
+        return stranger
+    end
+    -- A flood of tokens with unknown kids causes one fetch per cooldown.
+    for i = 1, 10 do
+        NOW = start + 60 + i
+        assert(id_token_error(idp, client).cause.code == "signature")
+    end
+    assert(idp.hits.jwks == 2)
+    NOW = start + 60 + 70
+    id_token_error(idp, client)
+    assert(idp.hits.jwks == 3)
+    NOW = start
+end
+
+local function jwks_expires_test()
+    local idp = new_idp()
+    local client = new_client(idp, { jwks_ttl = 600 })
+    local start = NOW
+    sign_in(idp, client)
+    NOW = start + 599
+    sign_in(idp, client)
+    assert(idp.hits.jwks == 1)
+    NOW = start + 600
+    sign_in(idp, client)
+    assert(idp.hits.jwks == 2)
+    NOW = start
+end
+
+local function removed_key_stops_working_test()
+    local idp = new_idp()
+    local client = new_client(idp, { jwks_ttl = 600 })
+    local start = NOW
+    local old_key, old_kid = idp.sign_key, idp.kid
+    sign_in(idp, client)
+    idp:rotate("ec-2")
+    -- A token signed with the retired key passes until the key set expires.
+    idp.tamper = function(_, options)
+        options.header = { kid = old_kid }
+        return old_key
+    end
+    assert(sign_in(idp, client).claims.sub == "user-42")
+    NOW = start + 600
+    assert(id_token_error(idp, client).cause.code == "signature")
+    NOW = start
+end
+
+-- Discovery -----------------------------------------------------------------------------
+
+local function discovery_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    assert(idp.hits.discovery == 0)
+    assert(client:discover() == client and client:discover() == client)
+    assert(idp.hits.discovery == 1)
+    assert(client.token_endpoint == "https://idp.example/token" and client.jwks_uri == "https://idp.example/jwks")
+    assert(idp.requests[1].path == "/.well-known/openid-configuration")
+    -- An endpoint from the options wins over the document.
+    local custom = new_client(idp, { userinfo_endpoint = "https://api.example/me/userinfo" })
+    custom:discover()
+    assert(custom.userinfo_endpoint == "https://api.example/me/userinfo" and custom.token_endpoint == "https://idp.example/token")
+    -- A trailing slash on the issuer is dropped.
+    local slashed = new_client(idp, { issuer = "https://idp.example/" })
+    assert(slashed:discover().issuer == "https://idp.example")
+end
+
+local function discovery_errors_test()
+    local idp = new_idp()
+    -- A document for another issuer is refused.
+    local other = new_client(idp, { issuer = "https://impostor.example" })
+    assert(error_of(other.discover, other).code == "response")
+    assert(error_of(other.authorize_url, other).code == "response")
+    idp.discovery_reply = function() return 404, "not found", {} end
+    local missing = new_client(idp)
+    local err = error_of(missing.discover, missing)
+    assert(err.code == "response" and err.status == 404)
+    idp.discovery_reply = function() return 200, "<html>", {} end
+    assert(error_of(missing.discover, missing).code == "response")
+    idp.discovery_reply = nil
+    assert(missing:discover().token_endpoint == "https://idp.example/token")
+end
+
+local function static_endpoints_skip_discovery_test()
+    local idp = new_idp()
+    local client = new_client(idp, {
+        authorization_endpoint = "https://idp.example/authorize", token_endpoint = "https://idp.example/token",
+        jwks_uri = "https://idp.example/jwks",
+    })
+    assert(sign_in(idp, client).claims.sub == "user-42")
+    assert(idp.hits.discovery == 0)
+end
+
+-- Refresh and userinfo ------------------------------------------------------------------
+
+local function refresh_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local tokens = sign_in(idp, client)
+    local renewed = client:refresh(tokens.refresh_token)
+    assert(renewed.access_token ~= tokens.access_token and renewed.expires_at == NOW + 3600)
+    -- The provider sent no new refresh token, so the result keeps the old one.
+    assert(renewed.refresh_token == tokens.refresh_token)
+    assert(renewed.claims.sub == "user-42" and renewed.claims.nonce == nil)
+    local form = parse_query(idp.requests[#idp.requests].body)
+    assert(form.grant_type == "refresh_token" and form.refresh_token == tokens.refresh_token and form.scope == nil)
+
+    idp.rotate_refresh = true
+    local rotated = client:refresh(renewed, { scope = { "openid" } })
+    assert(rotated.refresh_token ~= tokens.refresh_token and rotated.scope == "openid")
+    local err = error_of(client.refresh, client, tokens.refresh_token)
+    assert(err.code == "provider" and err.error == "invalid_grant")
+    assert(not catch client:refresh(nil))
+    assert(not catch client:refresh({}))
+end
+
+local function refreshed_id_token_is_validated_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local tokens = sign_in(idp, client)
+    idp.tamper = function(claims) claims.aud = "another-client" end
+    assert(error_of(client.refresh, client, tokens).code == "id_token")
+end
+
+local function userinfo_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    local tokens = sign_in(idp, client)
+    local profile = client:userinfo(tokens)
+    assert(profile.sub == "user-42" and profile.name == "Ada")
+    assert(client:userinfo(tokens.access_token).email == "ada@example.com")
+    local request = idp.requests[#idp.requests]
+    assert(request.method == "GET" and request.headers.authorization == "Bearer " .. tokens.access_token)
+
+    local err = error_of(client.userinfo, client, "revoked")
+    assert(err.code == "provider" and err.status == 401 and err.error == "invalid_token")
+    -- A profile of another user is refused when the ID token names the user.
+    idp.userinfo_reply = { sub = "user-7", name = "Mallory" }
+    assert(error_of(client.userinfo, client, tokens).code == "response")
+    assert(client:userinfo(tokens.access_token).sub == "user-7")
+    assert(not catch client:userinfo({}))
+end
+
+-- Presets -------------------------------------------------------------------------------
+
+local function preset(name, idp, extra)
+    local options = { client_id = CLIENT_ID, client_secret = CLIENT_SECRET, redirect = REDIRECT, fetch = idp.fetch, clock = clock }
+    for k, v in pairs(extra or {}) do
+        options[k] = v
+    end
+    return oauth.provider(name, options)
+end
+
+local function github_preset_test()
+    local idp = new_idp()
+    idp.user = { id = 583231, login = "octocat" }
+    local github = preset("github", idp)
+    local url, flow = github:authorize_url({ scope = { "read:user", "user:email" } })
+    assert(url:find("https://github.com/login/oauth/authorize?", 1, true) == 1)
+    assert(flow.nonce == nil and flow.verifier ~= nil)
+    assert(query_of(url).scope == "read:user user:email")
+    local tokens = github:exchange(idp:authorize(url), flow)
+    assert(tokens.access_token and tokens.claims == nil and tokens.id_token == nil)
+    local request = idp.requests[#idp.requests]
+    assert(request.path == "/login/oauth/access_token" and request.headers.accept == "application/json")
+    assert(parse_query(request.body).client_secret == CLIENT_SECRET)
+    assert(github:userinfo(tokens).login == "octocat")
+    assert(idp.requests[#idp.requests].path == "/user")
+    assert(idp.hits.discovery == 0 and idp.hits.jwks == 0)
+    assert(not catch github:verify_id_token("a.b.c"))
+end
+
+local function google_preset_test()
+    local idp = new_idp("https://accounts.google.com")
+    local google = preset("google", idp)
+    local url, flow = google:authorize_url({ params = { access_type = "offline" } })
+    assert(url:find("https://accounts.google.com/o/oauth2/v2/auth?", 1, true) == 1)
+    local query = query_of(url)
+    assert(query.scope == "openid email profile" and query.access_type == "offline" and query.nonce == flow.nonce)
+    local tokens = google:exchange(idp:authorize(url), flow)
+    assert(tokens.claims.iss == "https://accounts.google.com" and tokens.claims.email == "ada@example.com")
+    assert(idp.hits.discovery == 0 and idp.hits.jwks == 1)
+    assert(google:userinfo(tokens).sub == "user-42")
+end
+
+local TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47"
+local OTHER_TENANT = "11111111-2222-3333-4444-555555555555"
+
+local function microsoft_preset_test()
+    local idp = new_idp()
+    idp.id_token_issuer = `https://login.microsoftonline.com/$TENANT/v2.0`
+    idp.tamper = function(claims) claims.tid = TENANT end
+    -- The shared endpoint accepts the issuer of the tenant that the token names.
+    local common = preset("microsoft", idp)
+    local url, flow = common:authorize_url()
+    assert(url:find("https://login.microsoftonline.com/common/oauth2/v2.0/authorize?", 1, true) == 1)
+    local tokens = common:exchange(idp:authorize(url), flow)
+    assert(tokens.claims.tid == TENANT)
+    assert(idp.requests[#idp.requests].path == "/common/discovery/v2.0/keys")
+    -- A token whose issuer names another tenant than its tid is refused.
+    idp.tamper = function(claims) claims.tid = OTHER_TENANT end
+    assert(id_token_error(idp, common).message == "invalid ID token: unexpected issuer")
+    idp.tamper = function(claims) claims.tid = nil end
+    assert(id_token_error(idp, common).message == "invalid ID token: unexpected issuer")
+
+    -- One tenant accepts only its own issuer.
+    idp.tamper = function(claims) claims.tid = TENANT end
+    local single = preset("microsoft", idp, { tenant = TENANT })
+    url, flow = single:authorize_url()
+    assert(url:find(`https://login.microsoftonline.com/$TENANT/oauth2/v2.0/authorize?`, 1, true) == 1)
+    assert(single:exchange(idp:authorize(url), flow).claims.sub == "user-42")
+    idp.id_token_issuer = `https://login.microsoftonline.com/$OTHER_TENANT/v2.0`
+    assert(id_token_error(idp, single).cause.code == "claim")
+    assert(not catch preset("microsoft", idp, { tenant = "a/b" }))
+end
+
+local function gitlab_and_discord_presets_test()
+    local idp = new_idp("https://gitlab.example.org")
+    local gitlab = preset("gitlab", idp, { base = "https://gitlab.example.org/" })
+    local url, flow = gitlab:authorize_url()
+    assert(url:find("https://gitlab.example.org/oauth/authorize?", 1, true) == 1)
+    assert(gitlab:exchange(idp:authorize(url), flow).claims.iss == "https://gitlab.example.org")
+    assert(idp.requests[#idp.requests].path == "/oauth/discovery/keys")
+    assert(preset("gitlab", idp).token_endpoint == "https://gitlab.com/oauth/token")
+
+    local chat = new_idp()
+    chat.user = { id = "80351110224678912", username = "nelly" }
+    local discord = preset("discord", chat)
+    url, flow = discord:authorize_url()
+    assert(url:find("https://discord.com/oauth2/authorize?", 1, true) == 1)
+    assert(query_of(url).scope == "identify" and flow.nonce == nil)
+    local tokens = discord:exchange(chat:authorize(url), flow)
+    assert(discord:userinfo(tokens).username == "nelly")
+    assert(chat.requests[#chat.requests].path == "/api/users/@me")
+    assert(not catch oauth.provider("myspace", { client_id = "c" }))
+end
+
+local function apple_preset_test()
+    local idp = new_idp("https://appleid.apple.com")
+    idp.auth_methods = { post = true }
+    idp.always_id_token = true
+    idp.user = { sub = "001234.abcdef.5678" }
+    -- The developer key of the application, as the .p8 file holds it.
+    local developer, developer_public = crypto.keypair("P-256")
+    local seen = {}
+    idp.check_secret = function(secret)
+        seen[#seen + 1] = secret
+        local ok, claims, header = catch jwt.verify(secret, developer_public, {
+            algorithms = { "ES256" }, audience = "https://appleid.apple.com", issuer = "TEAM123456", clock = clock,
+        })
+        return ok and claims.sub == "com.example.app" and header.kid == "KEY1234567" and claims.exp == claims.iat + 3600
+    end
+    local apple = preset("apple", idp, {
+        client_id = "com.example.app",
+        team_id = "TEAM123456", key_id = "KEY1234567", private_key = developer:export("pem"),
+    })
+    local url, flow = apple:authorize_url()
+    assert(url:find("https://appleid.apple.com/auth/authorize?", 1, true) == 1)
+    assert(flow.nonce ~= nil and not url:find("response_mode", 1, true))
+    local tokens = apple:exchange(idp:authorize(url), flow)
+    assert(tokens.claims.sub == "001234.abcdef.5678" and tokens.claims.aud == "com.example.app")
+    assert(#seen == 1 and jwt.decode(seen[1]).alg == "ES256")
+
+    -- With scopes, Apple posts the callback as a form.
+    url, flow = apple:authorize_url({ scope = { "name", "email" } })
+    assert(query_of(url).response_mode == "form_post")
+    apple:exchange(idp:authorize(url), flow)
+    -- The client secret is signed once and used until it nears its end.
+    assert(#seen == 2 and seen[1] == seen[2])
+    local start = NOW
+    NOW = start + 3550
+    url, flow = apple:authorize_url()
+    apple:exchange(idp:authorize(url), flow)
+    assert(#seen == 3 and seen[3] ~= seen[1])
+    NOW = start
+
+    assert(not catch preset("apple", idp, { team_id = "T" }))
+    assert(not catch preset("apple", idp, { team_id = "T", key_id = "K", private_key = "not a key" }))
+    assert(preset("apple", idp, { team_id = "T", key_id = "K", private_key = developer }))
+end
+
+-- Configuration and secrets -------------------------------------------------------------
+
+local function provider_errors_test()
+    assert(not catch oauth.provider("github"))
+    assert(not catch oauth.provider("github", {}))
+    assert(not catch oauth.provider({ client_id = "" }))
+    assert(not catch oauth.provider({ client_id = "c", auth = "jwt" }))
+    assert(not catch oauth.provider({ client_id = "c", client_secret = 42 }))
+    local bare = oauth.provider({ client_id = "c", redirect = REDIRECT })
+    assert(not catch bare:authorize_url())
+    assert(not catch bare:userinfo("at"))
+    assert(not catch bare:refresh("rt"))
+    assert(not oauth.is_error("text") and not oauth.is_error({}) and not oauth.is_error(nil))
+end
+
+local function scan(value, needle, seen)
+    if type(value) == "string" then
+        assert(not value:find(needle, 1, true))
+    elseif type(value) == "table" and not seen[value] then
+        seen[value] = true
+        for k, v in pairs(value) do
+            scan(k, needle, seen)
+            scan(v, needle, seen)
+        end
+    end
+end
+
+local function secrets_stay_hidden_test()
+    local idp = new_idp()
+    local client = new_client(idp)
+    sign_in(idp, client)
+    scan(client, CLIENT_SECRET, {})
+    assert(tostring(client) == "oauth.provider: https://idp.example")
+    assert(tostring(preset("github", idp)) == "oauth.provider: github")
+    -- A refused request reports neither the secret nor the verifier.
+    idp.client_secret = "changed"
+    local url, flow = client:authorize_url()
+    local err = error_of(client.exchange, client, idp:authorize(url), flow)
+    assert(err.error == "invalid_client")
+    scan(err, CLIENT_SECRET, {})
+    scan(err, flow.verifier, {})
+end
+
+-- A real round trip ---------------------------------------------------------------------
+
+local function bind()
+    pledge("network")
+    return network.tcp.bind("127.0.0.1", 0)
+end
+
+local function round_trip_test()
+    local ok, server = catch bind()
+    if not ok then
+        skip("cannot bind a local port: " .. tostring(server))
+    end
+    local _, port = server:getsockname()
+    local idp = new_idp(`http://127.0.0.1:$port`)
+    idp.rotate_refresh = true
+    local serving = coroutine.detach(coroutine.create(network.serve), server, function(req)
+        return idp.handle(req.method, req.path, req.headers, vector.tostring(req.body))
+    end)
+
+    -- The provider uses network.fetch and the real clock.
+    NOW = os.time()
+    local client = oauth.provider({
+        issuer = idp.issuer, client_id = CLIENT_ID, client_secret = CLIENT_SECRET, redirect = REDIRECT,
+        scope = { "openid", "email" },
+    })
+    local url, flow = client:authorize_url()
+    assert(url:find(`http://127.0.0.1:$port/authorize?`, 1, true) == 1)
+    local tokens = client:exchange(idp:authorize(url), flow)
+    assert(tokens.claims.sub == "user-42" and tokens.claims.nonce == flow.nonce)
+    assert(client:userinfo(tokens).email == "ada@example.com")
+    local renewed = client:refresh(tokens)
+    assert(renewed.access_token ~= tokens.access_token and renewed.refresh_token ~= tokens.refresh_token)
+    assert(idp.hits.discovery == 1 and idp.hits.jwks == 1 and idp.hits.token == 2 and idp.hits.userinfo == 1)
+    assert(idp.requests[2].headers["content-type"] == "application/x-www-form-urlencoded")
+
+    idp.tamper = function(claims) claims.nonce = "replayed" end
+    url, flow = client:authorize_url()
+    assert(error_of(client.exchange, client, idp:authorize(url), flow).code == "id_token")
+
+    coroutine.close(serving)
+    server:close()
+    url, flow = client:authorize_url()
+    assert(error_of(client.exchange, client, { code = "c", state = flow.state }, flow).code == "network")
+    NOW = 1800000000
+end
