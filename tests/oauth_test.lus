@@ -1085,9 +1085,9 @@ local function bind()
 end
 
 local function round_trip_test()
-    local ok, server = catch bind()
-    if not ok then
-        skip("cannot bind a local port: " .. tostring(server))
+    local server, bind_err = bind()
+    if not server then
+        skip("cannot bind a local port: " .. tostring(bind_err))
     end
     local _, port = server:getsockname()
     local idp = new_idp(`http://127.0.0.1:$port`)
