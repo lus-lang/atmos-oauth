@@ -3,7 +3,7 @@
 --- A provider holds the endpoints of an authorization server and the
 --- credentials of one client. `provider:authorize_url` builds the URL that
 --- the browser of the user visits, with a random `state`, a PKCE challenge,
---- and a `nonce`. `provider:exchange` trades the code of the callback for
+--- and a `nonce`. `provider:exchange` exchanges the code of the callback for
 --- tokens and validates the ID token against the keys of the provider.
 --- `provider:refresh` renews the tokens. `provider:userinfo` reads the
 --- profile of the user.
@@ -27,12 +27,12 @@
 --- local url, flow = google:authorize_url()
 ---
 --- -- The callback request carries the code and the state in its query.
---- local tokens = google:exchange(req.query_params, flow)
+--- local tokens = google:exchange(req.query, flow)
 --- print(tokens.claims.sub, tokens.claims.email)
 --- ```
 ---
 --- @package oauth
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-oauth
@@ -66,14 +66,14 @@ end
 --- - `"state"`: the `state` of the callback differs from the state of the flow.
 --- - `"provider"`: the provider answered with an OAuth error. The error holds
 ---   the `error` code of the provider, its `description` when the provider
----   sent one, and the `status` of the response when the error came from an
+---   sent one, and the `status` of the response when the error comes from an
 ---   endpoint.
 --- - `"response"`: a response is not what the protocol requires, such as a
 ---   body that is not JSON, a token response without an access token, or a
 ---   discovery document of another issuer. The error holds the `status`.
 --- - `"network"`: a request got no response. The error holds the transport
 ---   error in `cause`.
---- - `"id_token"`: the ID token is invalid. When `jwt.verify` rejected it,
+--- - `"id_token"`: the ID token is invalid. When `jwt.verify` rejects it,
 ---   the error holds the error object of `jwt` in `cause`.
 --- @param value any The value to test.
 --- @return boolean
@@ -317,8 +317,8 @@ local ENDPOINTS = { "authorization_endpoint", "token_endpoint", "userinfo_endpoi
 ---   defaults to 60.
 --- - `jwks_ttl`: how many seconds the provider keeps the keys that it
 ---   fetched, which defaults to 3600.
---- - `jwks_cooldown`: the least number of seconds between two fetches of the
----   keys that tokens with an unknown `kid` cause, which defaults to 60.
+--- - `jwks_cooldown`: the minimum number of seconds between two fetches of
+---   the keys after a token with an unknown `kid`, which defaults to 60.
 --- - `fetch`: a function with the arguments and results of `network.fetch`
 ---   that sends every request, which defaults to `network.fetch`.
 --- - `clock`: a function that returns the time in seconds, which defaults to
@@ -337,8 +337,8 @@ local ENDPOINTS = { "authorization_endpoint", "token_endpoint", "userinfo_endpoi
 --- its client secret with them as an ES256 token that lasts
 --- `client_secret_ttl` seconds, 3600 by default.
 ---
---- An unknown preset, a missing `client_id`, and an option of the wrong
---- type each raise an error.
+--- `oauth.provider` raises an error if the preset is unknown, if
+--- `client_id` is missing, or if an option has the wrong type.
 --- @param name string|table The preset, or the options of a provider with no preset.
 --- @param options table? The options.
 --- @return table The provider.
@@ -430,16 +430,16 @@ end
 
 --- Loads the discovery document of the issuer and returns the provider.
 ---
---- A provider that needs discovery calls it by itself, so a program calls
---- it only to fail early, at startup. The first call fetches
+--- A provider that needs discovery runs it on its first call that needs an
+--- endpoint, so a program calls `provider:discover` only to fail early, at
+--- startup. The first call fetches
 --- `ISSUER/.well-known/openid-configuration` and fills the endpoints that
 --- the options left out. Later calls, and calls on a provider whose
 --- endpoints are all set, send nothing.
 ---
---- A request that fails raises the `"network"` error. A status other than
---- 200, a body that is not a JSON object, and a document whose `issuer`
---- differs from the issuer of the provider each raise the `"response"`
---- error.
+--- A request that fails raises the `"network"` error. The `"response"` error
+--- is raised if the status is not 200, if the body is not a JSON object, or
+--- if the `issuer` of the document differs from the issuer of the provider.
 --- @return table The provider.
 function Provider:discover()
     if self.discovered then
@@ -489,16 +489,18 @@ end
 --- The application redirects the browser of the user to the URL. It stores
 --- the flow on its own side, for example in the session of the user, then
 --- passes it to `provider:exchange` in the callback request. The flow is a
---- table of strings: `state`, a random value that ties the callback to this
---- browser, `verifier`, the PKCE code verifier, `nonce`, and `redirect`.
---- Each of the three random values encodes 32 random bytes. The URL carries
---- the `state`, the S256 challenge of the verifier, and the `nonce`. The
+--- table of the following strings.
+---
+--- - `state`: a random value that ties the callback to this browser.
+--- - `verifier`: the PKCE code verifier, unless `pkce` is `false`.
+--- - `nonce`: a random value that the ID token must carry. The flow has it
+---   when the scopes include `openid` or the preset is `"apple"`.
+--- - `redirect`: the redirect URI.
+---
+--- Each generated random value encodes 32 random bytes. The URL carries the
+--- `state`, the S256 challenge of the verifier, and the `nonce`. The
 --- verifier itself appears in the flow alone and must stay secret, so the
 --- flow belongs in server-side storage or in an encrypted cookie.
----
---- The flow has a `nonce` when the scopes include `openid`, and always
---- with the `"apple"` preset. `provider:exchange` then requires an ID token
---- with that nonce.
 ---
 --- The options are the following.
 ---
@@ -509,8 +511,8 @@ end
 ---   `login_hint`, or `access_type`. They replace generated parameters of
 ---   the same name.
 ---
---- A provider with no redirect URI in either place raises an error.
---- Discovery, when the provider needs it, raises the errors of
+--- A provider with no redirect URI in either place raises an error, as does
+--- a provider without an authorization endpoint. Discovery, when the provider needs it, raises the errors of
 --- `provider:discover`.
 --- @param options table? The options.
 --- @return string The URL.
@@ -630,7 +632,7 @@ end
 ---
 --- An invalid token raises the `"id_token"` error. A key request that fails
 --- raises the `"network"` or the `"response"` error. A provider without a
---- `jwks_uri` or an issuer raises an error.
+--- `jwks_uri` or without an issuer raises an error.
 --- @param token string The ID token.
 --- @param options table? The options `nonce`, `access_token`, and `max_age`.
 --- @return table The claims.
@@ -752,7 +754,7 @@ local function token_request(self, fields)
     return tokens
 end
 
---- Trades the code of a callback for tokens.
+--- Exchanges the code of a callback for tokens.
 ---
 --- `params` is the table of parameters that the provider sent to the
 --- redirect URI: the query of the callback request, or its form body with
@@ -775,14 +777,14 @@ end
 --- - A state that is missing or different raises the `"state"` error.
 --- - An `error` parameter raises the `"provider"` error with its `error`
 ---   and `description`.
---- - An `iss` parameter that differs from the issuer of the provider, and a
----   missing `code`, each raise the `"response"` error.
+--- - An `iss` parameter that differs from the issuer of the provider raises
+---   the `"response"` error, as does a missing `code`.
 --- - A token response with an `error` field raises the `"provider"` error.
----   Any other status outside 200 to 299, a body that is not a JSON object,
----   and a response without an access token each raise the `"response"`
----   error.
---- - An invalid ID token, and a missing one when the flow has a `nonce`,
----   raise the `"id_token"` error. `provider:verify_id_token` lists the
+---   The `"response"` error is raised if the status is otherwise outside
+---   200 to 299, if the body is not a JSON object, or if the response has
+---   no access token.
+--- - An ID token that is invalid, or missing when the flow has a `nonce`,
+---   raises the `"id_token"` error. `provider:verify_id_token` lists the
 ---   checks.
 --- @param params table The parameters of the callback.
 --- @param flow table The flow of `provider:authorize_url`.
@@ -826,14 +828,14 @@ function Provider:exchange(params, flow)
     return tokens
 end
 
---- Trades a refresh token for new tokens.
+--- Exchanges a refresh token for new tokens.
 ---
 --- The result has the shape of the result of `provider:exchange`. A
 --- response without a `refresh_token` keeps the one that was sent, so the
 --- result always has the refresh token to use next. A response with an ID
 --- token has it validated, without a nonce, into `claims`.
 ---
---- `options.scope` asks for a subset of the scopes that the user granted.
+--- `options.scope` requests a subset of the scopes that the user granted.
 --- The errors are those of the token request and of the ID token in
 --- `provider:exchange`. A provider answers a refresh token that expired or
 --- was revoked with the `"provider"` error whose `error` is
