@@ -14,22 +14,55 @@
 --- no endpoints reads them from the OpenID Connect discovery document of
 --- the issuer.
 ---
---- The following example signs a user in with Google in two requests. The
---- application stores `flow` in the session of the user between them.
+--- The following example signs a user in with Google in two handlers of a
+--- `web` application. The first handler sends the browser to Google and
+--- keeps the flow in the session of the user. The second handler receives
+--- the callback and reads the identity of the user from the validated ID
+--- token.
 ---
 --- ```lus nocheck
 --- local oauth = require("https://atmosp.here/2.0/oauth.lus")
+---
 --- local google = oauth.provider("google", {
----     client_id = id, client_secret = secret, redirect = "https://app.example/callback",
+---     client_id = os.getenv("GOOGLE_CLIENT_ID"),
+---     client_secret = os.getenv("GOOGLE_CLIENT_SECRET"),
+---     redirect = "https://app.example/callback",
 --- })
 ---
---- -- The first request sends the browser to Google.
---- local url, flow = google:authorize_url()
+--- app:get("/login", function(req, res)
+---     local url, flow = google:authorize_url()
+---     req.session.flow = flow
+---     return res:redirect(url)
+--- end)
 ---
---- -- The callback request carries the code and the state in its query.
---- local tokens = google:exchange(req.query, flow)
---- print(tokens.claims.sub, tokens.claims.email)
+--- app:get("/callback", function(req, res)
+---     local ok, tokens = catch google:exchange(req.query, req.session.flow)
+---     req.session.flow = nil
+---
+---     if not ok then
+---         return 400, tostring(tokens)
+---     end
+---
+---     req.session.user = { id = tokens.claims.sub, email = tokens.claims.email }
+---     return res:redirect("/")
+--- end)
 --- ```
+---
+--- The following provider has no preset, so it reads its endpoints from the
+--- discovery document of its issuer.
+---
+--- ```lus nocheck
+--- local idp = oauth.provider({
+---     issuer = "https://login.example.com",
+---     client_id = id,
+---     client_secret = secret,
+---     redirect = "https://app.example/callback",
+---     scope = { "openid", "email" },
+--- })
+--- ```
+---
+--- The package requires a Lus runtime whose `crypto` module has RSA and
+--- ECDSA keys.
 ---
 --- @package oauth
 --- @version 1.0.0
@@ -48,8 +81,9 @@ local type, tostring, pairs, ipairs = type, tostring, pairs, ipairs
 
 local OauthError = {}
 OauthError.__index = OauthError
+
 OauthError.__tostring = function(err)
-    return "oauth: " .. err.message
+    return `oauth: $(err.message)`
 end
 
 local function raise(code, message, fields)
@@ -81,57 +115,77 @@ function M.is_error(value)
     return getmetatable(value) == OauthError
 end
 
+local function system_clock()
+    return time.now():epoch()
+end
+
 -- Encoding ----------------------------------------------------------------------
 
 local function b64url(data)
-    return (string.transcode(data, "binary", "base64"):gsub("=+$", ""):gsub("+", "-"):gsub("/", "_"))
+    local text = string.transcode(data, "binary", "base64"):gsub("=+$", "")
+    return (text:gsub("+", "-"):gsub("/", "_"))
 end
 
 local function unb64url(text)
     local padded = text:gsub("-", "+"):gsub("_", "/")
     local rest = #padded % 4
+
     if rest > 0 then
         padded = padded .. string.rep("=", 4 - rest)
     end
-    local ok, bytes = catch string.transcode(padded, "base64", "binary")
-    if not ok then
-        return nil
+
+    if ok, bytes = catch string.transcode(padded, "base64", "binary") then
+        return type(bytes) == "string" and vector.fromstring(bytes) or bytes
     end
-    return type(bytes) == "string" and vector.fromstring(bytes) or bytes
+
+    return nil
 end
 
 -- Percent-encodes every byte outside the unreserved set of RFC 3986.
 local function escape(value)
     local text = tostring(value)
+
     if not text:find("[^%w%-%._~]") then
         return text
     end
+
     local bytes = vector.fromstring(text)
     local out = {}
-    for i = 0, vector.size(bytes) - 1 do
+
+    for i = 0, #bytes - 1 do
         local b = vector.get(bytes, i)
-        if b >= 48 and b <= 57 or b >= 65 and b <= 90 or b >= 97 and b <= 122
-            or b == 45 or b == 46 or b == 95 or b == 126
-        then
+
+        if b >= 48 and b <= 57
+            or b >= 65 and b <= 90
+            or b >= 97 and b <= 122
+            or b == 45
+            or b == 46
+            or b == 95
+            or b == 126 then
             out[#out + 1] = string.char(b)
         else
             out[#out + 1] = string.format("%%%02X", b)
         end
     end
+
     return table.concat(out)
 end
 
 -- Encodes a table as a query string, with its keys in sorted order.
 local function encode_query(fields)
     local names = {}
+
     for name in pairs(fields) do
         names[#names + 1] = name
     end
+
     table.sort(names)
     local out = {}
+
     for i, name in ipairs(names) do
         out[i] = `$(escape(name))=$(escape(fields[name]))`
     end
+
     return table.concat(out, "&")
 end
 
@@ -153,10 +207,27 @@ end
 -- Presets -----------------------------------------------------------------------
 
 local ASYMMETRIC = {
-    RS256 = true, RS384 = true, RS512 = true, PS256 = true, PS384 = true, PS512 = true,
-    ES256 = true, ES384 = true, EdDSA = true,
+    RS256 = true,
+    RS384 = true,
+    RS512 = true,
+    PS256 = true,
+    PS384 = true,
+    PS512 = true,
+    ES256 = true,
+    ES384 = true,
+    EdDSA = true,
 }
-local DEFAULT_ALGORITHMS = { "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA" }
+local DEFAULT_ALGORITHMS = {
+    "RS256",
+    "RS384",
+    "RS512",
+    "PS256",
+    "PS384",
+    "PS512",
+    "ES256",
+    "ES384",
+    "EdDSA",
+}
 
 local APPLE_ISSUER = "https://appleid.apple.com"
 
@@ -164,28 +235,39 @@ local APPLE_ISSUER = "https://appleid.apple.com"
 -- the developer account. The function signs a new one shortly before the
 -- last one expires.
 local function apple_secret(options, clock)
-    local team_id, key_id, key = options.team_id, options.key_id, options.private_key
+    local team_id, key_id, client_id from options
+    local key = options.private_key
+
     if type(team_id) ~= "string" or type(key_id) ~= "string" or key == nil then
         error("oauth.provider: the apple preset needs team_id, key_id, and private_key", 3)
     end
+
     if type(key) == "string" then
         local ok, imported = catch crypto.importkey(key)
+
         if not ok then
-            error("oauth.provider: cannot read private_key: " .. tostring(imported), 3)
+            error(`oauth.provider: cannot read private_key: $imported`, 3)
         end
+
         key = imported
     end
+
     local ttl = options.client_secret_ttl or 3600
-    local client_id = options.client_id
     local cached, expires = nil, 0
+
     return function()
         local now = clock()
+
         if cached == nil or now >= expires - 60 then
             cached = jwt.sign({ iss = team_id, aud = APPLE_ISSUER, sub = client_id }, key, {
-                alg = "ES256", expires_in = ttl, clock = clock, header = { kid = key_id },
+                alg = "ES256",
+                expires_in = ttl,
+                clock = clock,
+                header = { kid = key_id },
             })
             expires = now + ttl
         end
+
         return cached
     end
 end
@@ -212,9 +294,11 @@ local PRESETS = {
     end,
     microsoft = function(options)
         local tenant = options.tenant or "common"
+
         if type(tenant) ~= "string" or tenant:find("[^%w%.%-]") then
             error("oauth.provider: tenant must be a tenant name or identifier", 3)
         end
+
         local base = `https://login.microsoftonline.com/$tenant`
         local settings = {
             authorization_endpoint = `$base/oauth2/v2.0/authorize`,
@@ -224,19 +308,25 @@ local PRESETS = {
             scope = { "openid", "email", "profile" },
             auth = "post",
         }
-        if tenant:find("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") then
+
+        if tenant:find(
+            "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"
+        ) then
             settings.issuer = `$base/v2.0`
         else
             -- A shared endpoint signs for many tenants, so each token names
             -- its own tenant in `tid` and in its issuer.
             settings.issuer = function(claims)
                 local tid = claims.tid
+
                 if type(tid) ~= "string" or tid:find("[^%x%-]") then
                     return nil
                 end
+
                 return `https://login.microsoftonline.com/$tid/v2.0`
             end
         end
+
         return settings
     end,
     apple = function(options, clock)
@@ -278,6 +368,7 @@ local PRESETS = {
 
 local Provider = {}
 Provider.__index = Provider
+
 Provider.__tostring = function(self)
     return `oauth.provider: $(self.name)`
 end
@@ -322,7 +413,7 @@ local ENDPOINTS = { "authorization_endpoint", "token_endpoint", "userinfo_endpoi
 --- - `fetch`: a function with the arguments and results of `network.fetch`
 ---   that sends every request, which defaults to `network.fetch`.
 --- - `clock`: a function that returns the time in seconds, which defaults to
----   `os.time`.
+---   the current time.
 ---
 --- The presets set the endpoints, the default scopes, and `auth`. `"google"`,
 --- `"gitlab"`, `"microsoft"`, and `"apple"` are OpenID Connect providers
@@ -346,49 +437,64 @@ function M.provider(name, options)
     if type(name) == "table" then
         name, options = nil, name
     end
+
     if type(options) ~= "table" then
         error("oauth.provider: options must be a table", 2)
     end
+
     if type(options.client_id) ~= "string" or options.client_id == "" then
         error("oauth.provider: client_id must be a string", 2)
     end
-    local clock = options.clock or os.time
+
+    local clock = options.clock or system_clock
     local settings = {}
+
     if name ~= nil then
         local preset = PRESETS[name]
+
         if preset == nil then
-            error(`oauth.provider: unknown preset '$(tostring(name))'`, 2)
+            error(`oauth.provider: unknown preset '$name'`, 2)
         end
+
         settings = preset(options, clock)
     end
+
     local self = setmetatable({}, Provider)
     self.name = name or options.issuer or options.authorization_endpoint or "custom"
     self.client_id = options.client_id
     self.redirect = options.redirect
     self.scope = options.scope or settings.scope or {}
     self.auth = options.auth or settings.auth or "basic"
+
     if self.auth ~= "basic" and self.auth ~= "post" then
         error("oauth.provider: auth must be \"basic\" or \"post\"", 2)
     end
+
     self.pkce = options.pkce ~= false
     self.issuer = options.issuer or settings.issuer
+
     if type(self.issuer) == "string" then
         self.issuer = self.issuer:gsub("/+$", "")
     end
+
     for _, endpoint in ipairs(ENDPOINTS) do
         self[endpoint] = options[endpoint] or settings[endpoint]
     end
+
     self.always_nonce = settings.nonce == true
     self.form_post = settings.form_post == true
     local algorithms = options.algorithms or DEFAULT_ALGORITHMS
+
     if type(algorithms) ~= "table" or #algorithms == 0 then
         error("oauth.provider: algorithms must be a list", 2)
     end
+
     for _, alg in ipairs(algorithms) do
         if not ASYMMETRIC[alg] then
-            error(`oauth.provider: algorithm '$(tostring(alg))' cannot sign an ID token`, 2)
+            error(`oauth.provider: algorithm '$alg' cannot sign an ID token`, 2)
         end
     end
+
     self.algorithms = algorithms
     self.leeway = options.leeway or 60
     self.jwks_ttl = options.jwks_ttl or 3600
@@ -398,9 +504,11 @@ function M.provider(name, options)
     self.discovered = not (type(self.issuer) == "string"
         and (self.authorization_endpoint == nil or self.token_endpoint == nil))
     local secret = settings.client_secret or options.client_secret
+
     if secret ~= nil and type(secret) ~= "string" and type(secret) ~= "function" then
         error("oauth.provider: client_secret must be a string or a function", 2)
     end
+
     SECRETS[self] = secret
     return self
 end
@@ -410,21 +518,28 @@ end
 -- Sends one request. Returns the status, the body as text, and the headers.
 local function send(self, method, url, headers, body)
     local ok, status, data, response_headers = catch self.fetch(url, method, headers, body)
+
     if not ok then
-        raise("network", `the request to $(url:match("^[^?]*")) failed: $(tostring(status))`, { cause = status })
+        raise("network", `the request to $(url:match("^[^?]*")) failed: $status`, {
+            cause = status,
+        })
     end
+
     if type(data) == "vector" then
         data = vector.tostring(data)
     end
+
     return status, data or "", response_headers or {}
 end
 
 -- Decodes a JSON object, or returns nil.
 local function decode_object(text)
     local ok, value = catch fromjson(text)
+
     if ok and type(value) == "table" then
         return value
     end
+
     return nil
 end
 
@@ -445,23 +560,30 @@ function Provider:discover()
     if self.discovered then
         return self
     end
+
     local url = `$(self.issuer)/.well-known/openid-configuration`
     local status, body = send(self, "GET", url, { accept = "application/json" })
+
     if status ~= 200 then
         raise("response", `discovery answered with status $status`, { status = status })
     end
+
     local document = decode_object(body)
+
     if document == nil then
         raise("response", "the discovery document is not a JSON object", { status = status })
     end
+
     if document.issuer ~= self.issuer then
         raise("response", "the discovery document names another issuer", { status = status })
     end
+
     for _, endpoint in ipairs(ENDPOINTS) do
         if self[endpoint] == nil and type(document[endpoint]) == "string" then
             self[endpoint] = document[endpoint]
         end
     end
+
     self.discovered = true
     return self
 end
@@ -472,6 +594,7 @@ local function scope_text(scope)
     if type(scope) == "table" then
         return table.concat(scope, " ")
     end
+
     return scope or ""
 end
 
@@ -481,6 +604,7 @@ local function has_scope(scope, wanted)
             return true
         end
     end
+
     return false
 end
 
@@ -520,13 +644,17 @@ end
 function Provider:authorize_url(options)
     options = options or {}
     self:discover()
+
     if self.authorization_endpoint == nil then
         error("oauth: the provider has no authorization_endpoint", 2)
     end
+
     local redirect = options.redirect or self.redirect
+
     if type(redirect) ~= "string" then
         error("oauth: authorize_url needs a redirect URI", 2)
     end
+
     local scope = scope_text(options.scope or self.scope)
     local flow = { state = options.state or random_token(), redirect = redirect }
     local query = {
@@ -535,24 +663,30 @@ function Provider:authorize_url(options)
         redirect_uri = redirect,
         state = flow.state,
     }
+
     if scope ~= "" then
         query.scope = scope
+
         if self.form_post then
             query.response_mode = "form_post"
         end
     end
+
     if self.pkce then
         flow.verifier = random_token()
         query.code_challenge = M.challenge(flow.verifier)
         query.code_challenge_method = "S256"
     end
+
     if self.always_nonce or has_scope(scope, "openid") then
         flow.nonce = random_token()
         query.nonce = flow.nonce
     end
+
     for name, value in pairs(options.params or {}) do
         query[name] = value
     end
+
     local endpoint = self.authorization_endpoint
     local url = `$endpoint$(endpoint:find("?", 1, true) and "&" or "?")$(encode_query(query))`
     return url, flow
@@ -564,13 +698,17 @@ end
 local function fetch_keys(self)
     self.jwks_fetched = self.clock()
     local status, body = send(self, "GET", self.jwks_uri, { accept = "application/json" })
+
     if status ~= 200 then
         raise("response", `the key set answered with status $status`, { status = status })
     end
+
     local ok, keys = catch jwt.jwks(body)
+
     if not ok then
         raise("response", "the key set is not a JWKS document", { status = status })
     end
+
     self.keys = keys
     return keys
 end
@@ -580,14 +718,18 @@ end
 local function key_for(self, header)
     local now = self.clock()
     local keys = self.keys
+
     if keys == nil or now - self.jwks_fetched >= self.jwks_ttl then
         keys = fetch_keys(self)
         return keys(header)
     end
+
     local key = keys(header)
+
     if key == nil and now - self.jwks_fetched >= self.jwks_cooldown then
         key = fetch_keys(self)(header)
     end
+
     return key
 end
 
@@ -597,11 +739,13 @@ local HASH_OF = { ["256"] = "sha256", ["384"] = "sha384", ["512"] = "sha512" }
 local function at_hash_matches(alg, at_hash, access_token)
     local hash = alg == "EdDSA" and "sha512" or HASH_OF[alg:sub(3)]
     local given = type(at_hash) == "string" and unb64url(at_hash)
+
     if hash == nil or not given then
         return false
     end
+
     local digest = string.transcode(crypto.hash(hash, access_token), "binary", "hex")
-    return crypto.equal(digest:sub(1, #digest // 2), string.transcode(given, "binary", "hex"))
+    return crypto.equal(digest[1, #digest // 2], string.transcode(given, "binary", "hex"))
 end
 
 --- Validates an ID token and returns its claims.
@@ -640,67 +784,90 @@ end
 function Provider:verify_id_token(token, options)
     options = options or {}
     self:discover()
+
     if self.jwks_uri == nil or self.issuer == nil then
         error("oauth: verifying an ID token needs an issuer and a jwks_uri", 2)
     end
+
     local issuer = self.issuer
-    local ok, claims, header = catch jwt.verify(token, function(h) return key_for(self, h) end, {
+
+    local ok, claims, header = catch jwt.verify(token, function(h)
+        return key_for(self, h)
+    end, {
         algorithms = self.algorithms,
         issuer = type(issuer) == "string" and issuer or nil,
         audience = self.client_id,
         leeway = self.leeway,
         clock = self.clock,
     })
+
     if not ok then
         if jwt.iserror(claims) then
-            raise("id_token", "invalid ID token: " .. claims.message, { cause = claims })
+            raise("id_token", `invalid ID token: $(claims.message)`, { cause = claims })
         end
+
         error(claims, 0)
     end
+
     local function reject(message)
-        raise("id_token", "invalid ID token: " .. message)
+        raise("id_token", `invalid ID token: $message`)
     end
+
     if type(issuer) == "function" then
         local expected = issuer(claims)
+
         if expected == nil or claims.iss ~= expected then
             reject("unexpected issuer")
         end
     end
+
     local now = self.clock()
+
     if type(claims.exp) ~= "number" then
         reject("exp is missing")
     end
+
     if type(claims.iat) ~= "number" then
         reject("iat is missing")
     end
+
     if claims.iat > now + self.leeway then
         reject("iat is in the future")
     end
+
     if type(claims.sub) ~= "string" then
         reject("sub is missing")
     end
+
     local aud = claims.aud
+
     if type(aud) == "table" and #aud > 1 and claims.azp == nil then
         reject("azp is missing")
     end
+
     if claims.azp ~= nil and claims.azp ~= self.client_id then
         reject("unexpected azp")
     end
+
     if options.nonce ~= nil then
         if type(claims.nonce) ~= "string" or not crypto.equal(claims.nonce, options.nonce) then
             reject("unexpected nonce")
         end
     end
+
     if options.access_token ~= nil and claims.at_hash ~= nil then
         if not at_hash_matches(header.alg, claims.at_hash, options.access_token) then
             reject("at_hash does not fit the access token")
         end
     end
+
     if options.max_age ~= nil then
-        if type(claims.auth_time) ~= "number" or now - claims.auth_time > options.max_age + self.leeway then
+        if type(claims.auth_time) ~= "number"
+            or now - claims.auth_time > options.max_age + self.leeway then
             reject("the authentication is older than max_age")
         end
     end
+
     return claims, header
 end
 
@@ -709,17 +876,21 @@ end
 -- Posts a grant to the token endpoint and returns the decoded response.
 local function token_request(self, fields)
     self:discover()
+
     if self.token_endpoint == nil then
         error("oauth: the provider has no token_endpoint", 3)
     end
+
     local headers = {
         ["content-type"] = "application/x-www-form-urlencoded",
         accept = "application/json",
     }
     local secret = SECRETS[self]
+
     if type(secret) == "function" then
         secret = secret()
     end
+
     if secret == nil then
         fields.client_id = self.client_id
     elseif self.auth == "post" then
@@ -727,10 +898,12 @@ local function token_request(self, fields)
         fields.client_secret = secret
     else
         local pair = `$(escape(self.client_id)):$(escape(secret))`
-        headers.authorization = "Basic " .. string.transcode(pair, "binary", "base64")
+        headers.authorization = `Basic $(string.transcode(pair, "binary", "base64"))`
     end
+
     local status, body = send(self, "POST", self.token_endpoint, headers, encode_query(fields))
     local tokens = decode_object(body)
+
     if tokens ~= nil and type(tokens.error) == "string" then
         local description = tokens.error_description
         raise("provider", `the provider refused the request: $(tokens.error)`, {
@@ -739,18 +912,23 @@ local function token_request(self, fields)
             status = status,
         })
     end
+
     if status < 200 or status >= 300 then
         raise("response", `the token endpoint answered with status $status`, { status = status })
     end
+
     if tokens == nil then
         raise("response", "the token response is not a JSON object", { status = status })
     end
+
     if type(tokens.access_token) ~= "string" then
         raise("response", "the token response has no access token", { status = status })
     end
+
     if type(tokens.expires_in) == "number" then
         tokens.expires_at = self.clock() + tokens.expires_in
     end
+
     return tokens
 end
 
@@ -793,38 +971,47 @@ function Provider:exchange(params, flow)
     if type(params) ~= "table" then
         error("oauth: exchange needs the table of callback parameters", 2)
     end
+
     if type(flow) ~= "table" or type(flow.state) ~= "string" then
         error("oauth: exchange needs the flow of authorize_url", 2)
     end
+
     if type(params.state) ~= "string" or not crypto.equal(params.state, flow.state) then
         raise("state", "the state of the callback does not match the flow")
     end
+
     if params.error ~= nil then
         local description = params.error_description
-        raise("provider", `the provider refused the request: $(tostring(params.error))`, {
+        raise("provider", `the provider refused the request: $(params.error)`, {
             error = tostring(params.error),
             description = type(description) == "string" and description or nil,
         })
     end
+
     if params.iss ~= nil and type(self.issuer) == "string" and params.iss ~= self.issuer then
         raise("response", "the callback names another issuer")
     end
+
     if type(params.code) ~= "string" or params.code == "" then
         raise("response", "the callback has no code")
     end
+
     local tokens = token_request(self, {
         grant_type = "authorization_code",
         code = params.code,
         redirect_uri = flow.redirect or self.redirect,
         code_verifier = flow.verifier,
     })
+
     if type(tokens.id_token) == "string" and self.jwks_uri ~= nil and self.issuer ~= nil then
         tokens.claims = self:verify_id_token(tokens.id_token, {
-            nonce = flow.nonce, access_token = tokens.access_token,
+            nonce = flow.nonce,
+            access_token = tokens.access_token,
         })
     elseif flow.nonce ~= nil then
         raise("id_token", "the token response has no ID token to validate")
     end
+
     return tokens
 end
 
@@ -847,20 +1034,30 @@ function Provider:refresh(refresh_token, options)
     if type(refresh_token) == "table" then
         refresh_token = refresh_token.refresh_token
     end
+
     if type(refresh_token) ~= "string" then
         error("oauth: refresh needs a refresh token", 2)
     end
+
     local fields = { grant_type = "refresh_token", refresh_token = refresh_token }
-    if options and options.scope then
+
+    if options?.scope then
         fields.scope = scope_text(options.scope)
     end
+
     local tokens = token_request(self, fields)
+
     if tokens.refresh_token == nil then
         tokens.refresh_token = refresh_token
     end
+
     if type(tokens.id_token) == "string" and self.jwks_uri ~= nil and self.issuer ~= nil then
-        tokens.claims = self:verify_id_token(tokens.id_token, { access_token = tokens.access_token })
+        tokens.claims = self:verify_id_token(
+            tokens.id_token,
+            { access_token = tokens.access_token }
+        )
     end
+
     return tokens
 end
 
@@ -884,31 +1081,43 @@ end
 --- @return table The profile.
 function Provider:userinfo(tokens)
     local access_token, claims = tokens, nil
+
     if type(tokens) == "table" then
         access_token, claims = tokens.access_token, tokens.claims
     end
+
     if type(access_token) ~= "string" then
         error("oauth: userinfo needs an access token", 2)
     end
+
     self:discover()
+
     if self.userinfo_endpoint == nil then
         error("oauth: the provider has no userinfo_endpoint", 2)
     end
+
     local status, body = send(self, "GET", self.userinfo_endpoint, {
-        authorization = "Bearer " .. access_token,
+        authorization = `Bearer $access_token`,
         accept = "application/json",
     })
     local profile = decode_object(body)
+
     if status >= 400 then
-        local code = profile and type(profile.error) == "string" and profile.error or "userinfo"
-        raise("provider", `the userinfo endpoint answered with status $status`, { error = code, status = status })
+        local code = type(profile?.error) == "string" and profile.error or "userinfo"
+        raise("provider", `the userinfo endpoint answered with status $status`, {
+            error = code,
+            status = status,
+        })
     end
+
     if profile == nil then
         raise("response", "the userinfo response is not a JSON object", { status = status })
     end
+
     if claims ~= nil and profile.sub ~= nil and profile.sub ~= claims.sub then
         raise("response", "the userinfo response describes another user", { status = status })
     end
+
     return profile
 end
 

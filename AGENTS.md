@@ -36,7 +36,7 @@ lus doc oauth.lus       # print the reference
 ## Rules
 
 - Every public function has a doc comment that states each result and each error, following `spec/design/style.md` of the Lus repository.
-- The package never calls `pledge`. A new permission is declared in the header and in the README.
+- The package never calls `pledge`. A new permission is declared in the header.
 - Prose follows the `lus-writing` skill, which `lus agents init` installs and https://lus.dev/agents/skills/lus-writing/SKILL.md serves. In particular, prose has no dashes or semicolons and never names the Roblox Lua dialect.
 - Every bug fix comes with a test that fails without it.
 - ID tokens are verified with asymmetric algorithms only. The algorithm `none` and the HMAC algorithms stay refused.
